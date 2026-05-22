@@ -1,0 +1,35 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+*.prof
+
+# Coverage profiles
+cover
+coverage
+coverage.*
+
+# Local daemon state (SQLite db + WAL + upload markers)
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Per-developer credentials and config (see README's "Credentials" section)
+.env
+.env.local
+configs/local.yaml
+configs/*.local.yaml
+
+# Local test folder. Drop files into _test/in to exercise a localfs
+# source connector against a development config. Nothing here is part
+# of the project; the directory is per-developer.
+_test/
+
+# Editor / OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

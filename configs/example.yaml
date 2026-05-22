@@ -1,0 +1,114 @@
+## Uplink — example configuration
+##
+## A channel binds a storage-backed source to a destination. Storage
+## sources stay put: source files are read but never modified or
+## deleted by Uplink.
+##
+## Every field has a sensible default; this example shows the common
+## knobs uncommented and the less common ones commented out with the
+## production defaults next to them.
+
+logging:
+  level: info    # debug | info | warn | error
+  format: text   # text | json
+
+storage:
+  data_dir: "./data"
+
+# Worker pool + retry policy. Optional — omit the whole engine block
+# to take all defaults. See the "Tuning the engine" section in the
+# README for what each knob actually moves.
+engine:
+  workers: 8                # default 4; raise to 8–16 for production
+  # poll_idle: "500ms"      # how long workers sleep when idle
+  # max_attempts: 5         # retries before a job lands in failed
+  # base_backoff: "2s"      # first retry delay (doubles each attempt)
+
+connectors:
+  - name: fs-in
+    type: localfs
+    config:
+      root: "./incoming"
+      # The "default" poll cadence — the empty-prefix watcher uses
+      # this. Anything not claimed by a more-specific `watchers:`
+      # entry below polls at this interval.
+      poll_interval: "1h"
+
+      # Optional per-prefix watchers. Each runs its own poll loop at
+      # its own cadence, with state partitioned by scope. Paths
+      # belong to the watcher with the LONGEST matching prefix —
+      # `hot/x.jpg` is owned by the 10s watcher, NOT the root one.
+      watchers:
+        - prefix: "hot/"
+          poll_interval: "10s"
+        - prefix: "archive/"
+          poll_interval: "24h"
+
+  - name: aprimo-prod
+    type: aprimo
+    config:
+      environment: "your-aprimo-subdomain"
+      # Provide credentials inline, OR replace these two keys with
+      # client_id_env / client_secret_env pointing at environment
+      # variable names if you'd rather keep secrets out of the file.
+      client_id: "your-client-id"
+      client_secret: "your-client-secret"
+
+      default_status: "draft"
+
+      # Required when companion scripts on a channel using this connector
+      # emit field values. IETF culture tag (e.g. "en-US", "fr-FR")
+      # matching one configured in Aprimo's Admin → Languages.
+      # Companion-supplied values that don't specify `language` go to
+      # this default.
+      default_language: "en-US"
+
+      # How often the prefetched catalogs (field definitions, languages,
+      # classifications, option items, users, user groups) are reloaded
+      # from Aprimo in the background. New fields appear without a
+      # daemon restart. Default 1h. Set to 0s to disable.
+      refresh_interval: "1h"
+
+      # Sustained per-second request budget. Set this to your
+      # tenant's licensed Aprimo RPS (default allowance is on the
+      # order of 15; higher values are licensable per environment).
+      # Burst capacity is fixed at 100. With `rps` set, the daemon
+      # paces itself client-side so 429s never trip under normal
+      # load. 0 = disabled (rely on 429-retry alone). See the
+      # README's "Rate limiting" subsection for the full model.
+      rps: 15
+
+      # Cap on in-flight Aprimo HTTP requests. Memory + socket-pool
+      # safety net independent of `rps` above. 0 = uncapped (default).
+      # max_concurrent: 32
+
+      # default_collection: ""    # optional collection id; new records get filed here
+      # http_timeout: "60s"       # SDK request timeout
+
+channels:
+  - name: fs-to-aprimo
+    source: fs-in
+    destination: aprimo-prod
+    trigger:
+      # Fire on multiple event kinds with one channel (so a file's
+      # Create + later Update land on the SAME Aprimo record):
+      events: [OnCreate, OnUpdate]
+      # Or use `event:` (singular) for a single kind. Exactly one of
+      # the two forms must be set. Available kinds: OnCreate, OnUpdate,
+      # OnDelete, OnMove, OnMetadataChange.
+      # filter: 'size > 0'        # optional filter expression
+
+    # Optional: declare companion files that contribute metadata to
+    # the destination record. Each entry pairs a filename pattern with
+    # a sandboxed Lua script that returns field entries. Pattern
+    # tokens: ${basename}, ${extension}, ${name} named captures, *
+    # anonymous wildcards. ${basename} is required so the inverse
+    # resolver can locate the parent asset. Script paths are
+    # resolved relative to the directory holding the uplink binary.
+    # See the README's "Companion files" section for the full grammar
+    # and worked examples.
+    # companions:
+    #   - pattern: "${basename}.xmp"
+    #     script: ./scripts/xmp.lua
+    #   - pattern: "${basename}.caption.${lang}.txt"
+    #     script: ./scripts/captions.lua

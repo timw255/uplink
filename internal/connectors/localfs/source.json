@@ -1,0 +1,5 @@
+{
+  "id": "localfs",
+  "name": "Local filesystem",
+  "requiresAuth": false
+}

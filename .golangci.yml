@@ -1,0 +1,47 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - gocritic
+    - revive
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - copyloopvar
+    - unconvert
+    - prealloc
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+        - name: var-naming
+        - name: unused-parameter
+          disabled: true
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

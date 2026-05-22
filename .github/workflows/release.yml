@@ -1,0 +1,168 @@
+name: release
+
+# Every push to main:
+#   1. runs the test suite
+#   2. computes the next patch version from the most recent tag
+#      (skips with `[skip release]` in the commit message)
+#   3. builds 6 platform archives, each containing the binary + uplink.yaml
+#   4. publishes a GitHub Release with auto-generated notes + SHA256SUMS
+#
+# Non-patch bumps are operator-driven: push a tag like v0.2.0 manually.
+# The workflow's patch-bump logic resumes from that tag on the next push.
+
+on:
+  push:
+    branches: [main]
+
+# release-create needs to write a tag + create a release.
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.skip.outputs.value }}
+    steps:
+      - id: skip
+        run: |
+          msg=${{ toJSON(github.event.head_commit.message) }}
+          if printf '%s' "$msg" | grep -q '\[skip release\]'; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v5
+        if: steps.skip.outputs.value != 'true'
+      - uses: actions/setup-go@v5
+        if: steps.skip.outputs.value != 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go test
+        if: steps.skip.outputs.value != 'true'
+        run: go test ./... -count=1
+      - name: go vet
+        if: steps.skip.outputs.value != 'true'
+        run: go vet ./...
+
+  version:
+    needs: test
+    if: needs.test.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Need the full tag history to compute the next version.
+          fetch-depth: 0
+          fetch-tags: true
+      - id: next
+        name: Compute next patch version
+        run: |
+          set -euo pipefail
+          # Latest tag matching vX.Y.Z. If none exists yet, start from
+          # v0.0.0 so the first release becomes v0.1.0 (minor bump on
+          # the zero-tag case is a one-time exception to the
+          # patch-only auto-bump rule; gets the project to a sensible
+          # starting version).
+          latest=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n1)
+          if [ -z "$latest" ]; then
+            new_tag="v0.1.0"
+          else
+            # Parse major.minor.patch.
+            ver=${latest#v}
+            IFS=. read -r major minor patch <<< "$ver"
+            patch=$((patch + 1))
+            new_tag="v${major}.${minor}.${patch}"
+          fi
+          echo "tag=${new_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${new_tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Next release tag: $new_tag"
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target:
+          - { goos: linux,   goarch: amd64, ext: '',     archive: tar.gz }
+          - { goos: linux,   goarch: arm64, ext: '',     archive: tar.gz }
+          - { goos: darwin,  goarch: amd64, ext: '',     archive: tar.gz }
+          - { goos: darwin,  goarch: arm64, ext: '',     archive: tar.gz }
+          - { goos: windows, goarch: amd64, ext: '.exe', archive: zip }
+          - { goos: windows, goarch: arm64, ext: '.exe', archive: zip }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build + archive
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+          EXT: ${{ matrix.target.ext }}
+          ARCHIVE_FMT: ${{ matrix.target.archive }}
+        run: |
+          set -euo pipefail
+          BIN="uplink${EXT}"
+          ARCHIVE="uplink-v${VERSION}-${GOOS}-${GOARCH}"
+
+          mkdir -p stage dist
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "stage/${BIN}" ./cmd/uplink
+          cp configs/example.yaml stage/uplink.yaml
+
+          cd stage
+          case "$ARCHIVE_FMT" in
+            zip)
+              zip "../dist/${ARCHIVE}.zip" "${BIN}" uplink.yaml
+              ;;
+            tar.gz)
+              tar czf "../dist/${ARCHIVE}.tar.gz" "${BIN}" uplink.yaml
+              ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uplink-${{ matrix.target.goos }}-${{ matrix.target.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Stage release assets + checksums
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Flatten all matrix outputs into dist/.
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} dist/ \;
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -la dist/
+      - name: Create tag + release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true

@@ -1,0 +1,5 @@
+{
+  "id": "azblob",
+  "name": "Azure Blob Storage",
+  "requiresAuth": false
+}

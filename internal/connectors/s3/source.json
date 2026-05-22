@@ -1,0 +1,5 @@
+{
+  "id": "s3",
+  "name": "Amazon S3 (or S3-compatible)",
+  "requiresAuth": false
+}
