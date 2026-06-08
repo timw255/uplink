@@ -16,7 +16,15 @@ type Channel struct {
 	Spec       ChannelSpec
 	Filter     Filter
 	Companions []*Companion
+	Enrichers  []*Enricher
 	kinds      map[string]struct{}
+}
+
+// Enricher is the runtime form of an EnrichSpec — a compiled script
+// that derives metadata from the asset itself (no pattern, no companion
+// file). Runs once per asset lifecycle event the channel fires on.
+type Enricher struct {
+	Script CompiledScript
 }
 
 // Match reports whether the given event should fire this channel.
@@ -29,6 +37,22 @@ func (c *Channel) Match(e connector.Event) (bool, error) {
 		}
 	}
 	return c.Filter.Matches(e)
+}
+
+// HasEnrichers reports whether the channel declares any enrich scripts.
+func (c *Channel) HasEnrichers() bool { return len(c.Enrichers) > 0 }
+
+// FiresOn reports whether the channel's trigger names the given event
+// kind. Unlike Match it does not evaluate the CEL filter — callers in
+// the delete path use it because a delete Entry carries only a path
+// (no size/hash for a filter to act on). An empty kinds set (tests that
+// build Channel directly) matches any kind, mirroring Match.
+func (c *Channel) FiresOn(kind connector.EventKind) bool {
+	if len(c.kinds) == 0 {
+		return true
+	}
+	_, ok := c.kinds[string(kind)]
+	return ok
 }
 
 // Registry is the runtime catalog of channels keyed by source connector,
@@ -82,7 +106,19 @@ func NewRegistry(channels []ChannelSpec, compiler ScriptCompiler) (*Registry, er
 			})
 		}
 
-		ch := &Channel{Spec: spec, Filter: filter, Companions: companions, kinds: kinds}
+		var enrichers []*Enricher
+		for _, en := range spec.Enrich {
+			if compiler == nil {
+				return nil, fmt.Errorf("channel %q: enrich script %q declared but no script compiler was provided", spec.Name, en.Script)
+			}
+			script, err := compiler.Compile(en.Script, en.Script)
+			if err != nil {
+				return nil, fmt.Errorf("channel %q: enrich script %q: %w", spec.Name, en.Script, err)
+			}
+			enrichers = append(enrichers, &Enricher{Script: script})
+		}
+
+		ch := &Channel{Spec: spec, Filter: filter, Companions: companions, Enrichers: enrichers, kinds: kinds}
 		r.bySource[spec.Source] = append(r.bySource[spec.Source], ch)
 		r.byName[spec.Name] = ch
 	}

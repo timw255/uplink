@@ -305,7 +305,7 @@ channels:
 
 Use `event` for a single kind or `events` for a list — exactly one of the two must be set. A multi-event channel keeps a single sync_log stream per source path, so a file's Update lands as a new version on the same Aprimo record as its Create. Splitting Create and Update across separate channels gives each its own history and produces duplicate records on Update, which is rarely what you want.
 
-Available kinds: `OnCreate`, `OnUpdate`, `OnDelete`, `OnMove`, `OnMetadataChange`. Source-side deletes are not propagated to Aprimo by design — an Aprimo record outliving its source file is the intended behavior.
+Available kinds: `OnCreate`, `OnUpdate`, `OnDelete`. Source-side deletes are not propagated to Aprimo by design — an Aprimo record outliving its source file is the intended behavior. (There is intentionally no "move" kind: the supported backends have no rename primitive and no durable object id, so a relocation is a delete of the old path plus a create of the new one — see the note under [Enrich scripts](#enrich-scripts-metadata-from-the-asset-itself).)
 
 Filter expressions use Google's [Common Expression Language](https://github.com/google/cel-spec) — the operators you'd expect are available: `==`, `!=`, `<`, `>`, `&&`, `||`, plus string helpers like `startsWith`, `endsWith`, `contains`, and the `in` membership test.
 
@@ -523,6 +523,81 @@ Same `name` × different `language` entries consolidate into one Aprimo write ca
 The contrast with the previous example: per-language files give you one-write-per-locale (each file PATCHes independently when it changes); a JSON bundle gives you one-write-per-edit (a single change rewrites every locale). Pick the shape that matches how the upstream tool emits the data.
 
 Scripts are compiled at daemon startup; a syntactically broken script fails the daemon's startup so a bad change never silently corrupts metadata. Edits require a daemon restart.
+
+### Enrich scripts (metadata from the asset itself)
+
+Companion scripts react to a *sidecar file*. But often the metadata you want is already encoded in the asset's own path — a file synced from `emea/spring-2026/hero-banner.png` carries its region and campaign right there in the directory structure — with no sidecar to read. **Enrich scripts** cover that case: a sandboxed Lua script attached to a channel that runs against the asset *itself*, with no companion file and no pattern, once per lifecycle event.
+
+```yaml
+channels:
+  - name: brand-assets
+    source: fs-in
+    destination: aprimo-prod
+    trigger:
+      events: [OnCreate, OnUpdate, OnDelete]
+    enrich:
+      - script: scripts/derive-from-path.lua
+```
+
+Each entry is just a `script:` path (resolved relative to the `uplink` binary, same as companions) — there is no `pattern`, because an enrich script isn't matched against a filename. A channel can declare multiple enrich scripts and mix them freely with `companions:`; their returned fields all fold into the same write.
+
+#### When enrich scripts run
+
+Enrich scripts run on the asset's own events, **honoring the channel's `trigger`** — so list the kinds you want under `events:`:
+
+| Event | What happens | API call |
+|---|---|---|
+| **OnCreate** | Script runs; fields fold into the record `Create` — together with any companion presync fields. | folded into Create (no extra call) |
+| **OnUpdate** | Content changed; script re-runs and fields fold into the same Update write. Path-derived tags stay correct. | folded into Update (no extra call) |
+| **OnDelete** | Script runs with `uplink.event.deleted = true`; returned fields are **PATCHed** onto the existing record. The Aprimo record is **never deleted** — this is for flipping a field like `Lifecycle Status = "Retired"`. Dropped silently if the asset was never synced. | one PATCH |
+
+A note on **moves / renames**: there is no `OnMove` trigger, by design. Uplink's scanners detect changes by diffing the backend listing *by path*, and the supported object stores (S3, Azure Blob, B2) have no rename primitive and expose no durable object id that survives a copy — so a relocation is genuinely indistinguishable from a **delete of the old path plus a create of the new path**, and that is exactly how it's reported. The practical consequence: moving a file does **not** re-file its existing record. The new path mints a fresh record (with new-path-derived fields via OnCreate) while OnDelete fires against the record at the old path. If your intent was to re-classify or re-collection an existing asset, **don't do it by moving files** — the identity isn't carried across. Treat the source tree's layout as fixed once an asset is synced, and drive re-classification from a companion or enrich *field* instead.
+
+#### The script contract
+
+Identical to companion scripts: **return a list of `{ name = "...", value = ... }` entries** (optionally `language = "<culture>"`), and the Aprimo connector resolves names to ids and coerces values per field type. Return `{}` to contribute nothing. See [Supported field types](#supported-field-types) for the full table — a `TextList` field takes a Lua list of strings, which is exactly what path segments give you.
+
+The sandbox is the same gopher-lua environment as companion scripts (same library subset, same memory/time caps, same absent stdlib). Only the `uplink` table differs — there is **no** `uplink.file` and **no** `uplink.match` (an enrich script has no companion file and no captures):
+
+| Name | Shape |
+|---|---|
+| `uplink.asset` | `{ path, size, hash, extension, record_id }` — read-only. `record_id` is empty during a Create (the record doesn't exist yet) and populated on Update / Delete. |
+| `uplink.event` | `{ kind, deleted }`. `kind` is `"OnCreate"` / `"OnUpdate"` / `"OnDelete"`; `deleted` is a convenience bool, true exactly on delete. |
+| `uplink.log` / `uplink.fail` | Same as companion scripts. |
+| `uplink.parse_json` / `parse_xml` / `parse_csv` | Same pure parsers as companion scripts. |
+
+#### Example: path segments as fields
+
+A team files brand assets as `<region>/<campaign>/<filename>` — so `emea/spring-2026/hero-banner.png` should land in Aprimo with `Region = "emea"` and `Campaign = "spring-2026"`. When the source file is later removed, the record should be flagged rather than deleted. One enrich script does all of it:
+
+```lua
+-- A user-supplied script attached via `enrich:`. Not shipped with
+-- Uplink — keep it wherever your other scripts live.
+if uplink.event.deleted then
+  -- The source file is gone. We never delete the Aprimo record; just
+  -- flag it so downstream workflows can react.
+  return { { name = "Lifecycle Status", value = "Retired" } }
+end
+
+-- Split the path into segments and drop the filename, leaving the
+-- directories that describe the asset.
+local segs = {}
+for s in uplink.asset.path:gmatch("[^/]+") do
+  table.insert(segs, s)
+end
+table.remove(segs)
+
+-- This tree is two levels deep; bail out cleanly on anything shallower
+-- so a stray top-level file doesn't write garbage.
+if #segs < 2 then return {} end
+
+return {
+  { name = "Region",   value = segs[1] },   -- e.g. an OptionList
+  { name = "Campaign", value = segs[2] },   -- e.g. a single-line text field
+}
+```
+
+If you'd rather keep every segment without mapping positions, hand the whole list to a `TextList` field instead — `{ name = "Path Tags", value = segs }` writes one tag per directory. Either way the field names must match your Aprimo schema; the connector resolves and coerces from there.
 
 ### Ignoring files
 

@@ -16,7 +16,7 @@ import (
 //   - uplink.asset  — the parent asset (path, record_id, extension)
 //   - uplink.file   — the companion file (path, content, deleted)
 //   - uplink.match  — pattern + recovered captures (basename,
-//                     extension, vars, wildcards)
+//     extension, vars, wildcards)
 //   - uplink.log    — structured logging
 //   - uplink.fail   — explicit script-failure path
 //   - uplink.parse_json / parse_xml / parse_csv — pure parsers
@@ -63,6 +63,53 @@ func registerCompanionAPI(state *lua.LState, in *CompanionInput, logger *slog.Lo
 	match.RawSetString("wildcards", wilds)
 	tbl.RawSetString("match", match)
 
+	registerSharedAPI(state, tbl, logger)
+	state.SetGlobal("uplink", tbl)
+}
+
+// registerAssetAPI installs the `uplink` table for enrich-mode runs. An
+// enrich script reacts to the asset itself across its lifecycle, with no
+// companion file and no pattern match, so the surface is:
+//
+//   - uplink.asset  — the asset (path, size, hash, extension, record_id)
+//   - uplink.event  — what just happened (kind, deleted)
+//   - uplink.log    — structured logging
+//   - uplink.fail   — explicit script-failure path
+//   - uplink.parse_json / parse_xml / parse_csv — pure parsers
+//
+// Deliberately absent vs the companion API: uplink.file and uplink.match.
+// An enrich script has nothing to read and no captures — it derives
+// metadata from the asset's identity (commonly its path) and the event.
+func registerAssetAPI(state *lua.LState, in *AssetScriptInput, logger *slog.Logger) {
+	tbl := state.NewTable()
+
+	asset := state.NewTable()
+	asset.RawSetString("path", lua.LString(in.Asset.Path))
+	asset.RawSetString("size", lua.LNumber(in.Asset.Size))
+	asset.RawSetString("hash", lua.LString(in.Asset.Hash))
+	asset.RawSetString("record_id", lua.LString(in.AssetRecordID))
+	asset.RawSetString("extension", lua.LString(in.Extension))
+	tbl.RawSetString("asset", asset)
+
+	event := state.NewTable()
+	event.RawSetString("kind", lua.LString(in.Event.Kind))
+	if in.Event.Deleted {
+		event.RawSetString("deleted", lua.LTrue)
+	} else {
+		event.RawSetString("deleted", lua.LFalse)
+	}
+	tbl.RawSetString("event", event)
+
+	registerSharedAPI(state, tbl, logger)
+	state.SetGlobal("uplink", tbl)
+}
+
+// registerSharedAPI installs the parser + logging helpers common to
+// every script mode onto tbl. The per-mode registrars
+// (registerCompanionAPI, registerAssetAPI) build their mode-specific
+// tables (asset/file/match/event) and then call this for the shared
+// surface, so the parsers and log/fail behave identically everywhere.
+func registerSharedAPI(state *lua.LState, tbl *lua.LTable, logger *slog.Logger) {
 	tbl.RawSetString("parse_json", state.NewFunction(func(L *lua.LState) int {
 		s := L.CheckString(1)
 		v, err := parseJSON(L, s)
@@ -127,8 +174,6 @@ func registerCompanionAPI(state *lua.LState, in *CompanionInput, logger *slog.Lo
 		L.RaiseError("uplink.fail: %s", reason)
 		return 0
 	}))
-
-	state.SetGlobal("uplink", tbl)
 }
 
 // luaToGoList converts a Lua return value into a Go []any. The

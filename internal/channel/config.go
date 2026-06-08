@@ -83,6 +83,27 @@ type ChannelSpec struct {
 	Trigger     TriggerSpec     `yaml:"trigger"`
 	Transform   *TransformSpec  `yaml:"transform,omitempty"`
 	Companions  []CompanionSpec `yaml:"companions,omitempty"`
+	Enrich      []EnrichSpec    `yaml:"enrich,omitempty"`
+}
+
+// EnrichSpec describes an enrich-script declaration attached to a
+// channel. Unlike a companion, an enrich script has no pattern and is
+// not tied to a sidecar file — it runs against the asset itself once
+// per lifecycle event the channel's trigger fires on (create, update,
+// delete) and returns field entries that get folded into the record.
+//
+// The canonical use is deriving metadata from path structure (mapping
+// `emea/spring-2026/hero-banner.png` to Region and Campaign fields), but
+// a script can key off the asset's size/hash or the event kind too —
+// e.g. setting an "Archived" field when the source file is deleted.
+//
+//	enrich:
+//	  - script: scripts/derive-from-path.lua
+//
+// Script paths are resolved relative to the daemon binary at Load time,
+// the same as companion scripts.
+type EnrichSpec struct {
+	Script string `yaml:"script"`
 }
 
 // TriggerSpec defines what fires the channel. Filter is an optional CEL
@@ -107,11 +128,9 @@ type TriggerSpec struct {
 // validEventKinds enumerates the event kinds a channel trigger can name.
 // Matches the EventKind constants in internal/connector/connector.go.
 var validEventKinds = map[string]struct{}{
-	"OnCreate":         {},
-	"OnUpdate":         {},
-	"OnDelete":         {},
-	"OnMove":           {},
-	"OnMetadataChange": {},
+	"OnCreate": {},
+	"OnUpdate": {},
+	"OnDelete": {},
 }
 
 // kinds normalizes a TriggerSpec into the set of event kinds it fires on.
@@ -184,6 +203,12 @@ func Load(path string) (*Config, error) {
 			co := &cfg.Channels[i].Companions[j]
 			if co.Script != "" && !filepath.IsAbs(co.Script) {
 				co.Script = filepath.Join(exeDir, co.Script)
+			}
+		}
+		for j := range cfg.Channels[i].Enrich {
+			en := &cfg.Channels[i].Enrich[j]
+			if en.Script != "" && !filepath.IsAbs(en.Script) {
+				en.Script = filepath.Join(exeDir, en.Script)
 			}
 		}
 	}
@@ -298,6 +323,28 @@ func (c *Config) validate() error {
 			}
 			if info.IsDir() {
 				return fmt.Errorf("channel %q: companion %q: script %s is a directory", ch.Name, co.Pattern, co.Script)
+			}
+		}
+
+		// Enrich scripts: same script-file checks as companions, minus
+		// the pattern (there is none). Duplicate script paths are
+		// rejected — two identical declarations would just run the same
+		// derivation twice and double-write the same fields.
+		enrichScripts := make(map[string]struct{}, len(ch.Enrich))
+		for j, en := range ch.Enrich {
+			if en.Script == "" {
+				return fmt.Errorf("channel %q: enrich[%d]: script is required", ch.Name, j)
+			}
+			if _, dup := enrichScripts[en.Script]; dup {
+				return fmt.Errorf("channel %q: duplicate enrich script %q", ch.Name, en.Script)
+			}
+			enrichScripts[en.Script] = struct{}{}
+			info, err := os.Stat(en.Script)
+			if err != nil {
+				return fmt.Errorf("channel %q: enrich[%d]: script %s: %w", ch.Name, j, en.Script, err)
+			}
+			if info.IsDir() {
+				return fmt.Errorf("channel %q: enrich[%d]: script %s is a directory", ch.Name, j, en.Script)
 			}
 		}
 	}

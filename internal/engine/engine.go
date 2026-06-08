@@ -181,24 +181,43 @@ func (e *Engine) DispatchBatch(ctx context.Context, sourceConnector string, even
 		dispatchErrs = append(dispatchErrs, err)
 	}
 
-	if len(assetEvents) == 0 {
+	// Pull asset DELETE events out of the asset flow. They never delete
+	// the destination record (source-side deletes don't propagate), so
+	// the only work they can produce is an enrich PATCH on channels that
+	// declared OnDelete + enrich scripts (e.g. mark the record archived).
+	// Channels without enrichers simply drop deletes, as before.
+	var (
+		nonDeleteEvents = make([]connector.Event, 0, len(assetEvents))
+		deleteEvents    []connector.Event
+	)
+	for _, ev := range assetEvents {
+		if ev.Kind == connector.EventDelete {
+			deleteEvents = append(deleteEvents, ev)
+			continue
+		}
+		nonDeleteEvents = append(nonDeleteEvents, ev)
+	}
+	if err := e.dispatchEnrichDeletes(ctx, sourceConnector, deleteEvents); err != nil {
+		dispatchErrs = append(dispatchErrs, err)
+	}
+
+	if len(nonDeleteEvents) == 0 {
 		return errors.Join(dispatchErrs...)
 	}
-	events = assetEvents
+	events = nonDeleteEvents
 
 	// Per-channel failures don't abort the batch — they're collected
 	// and joined at the end. A transient sync_log lookup failure on one
 	// channel must not drop events for the other channels in matched[].
 	var channelErrs []error
 	for _, ch := range matched {
-		// First pass: filter by event kind + CEL + drop deletes. Collect
-		// the matching events for this channel before the sync_log lookup
-		// so we only do one bulk query per channel.
+		// First pass: filter by event kind + CEL. Deletes were already
+		// split out above (they route to dispatchEnrichDeletes), so only
+		// Create/Update/etc. reach here. Collect the matching events for
+		// this channel before the sync_log lookup so we only do one bulk
+		// query per channel.
 		matchedEvents := make([]connector.Event, 0, len(events))
 		for _, ev := range events {
-			if ev.Kind == connector.EventDelete {
-				continue // deletes never propagate to Aprimo
-			}
 			ok, err := ch.Match(ev)
 			if err != nil {
 				e.logger.Warn("filter eval failed",
@@ -363,7 +382,7 @@ func (e *Engine) runJob(ctx context.Context, log *slog.Logger, job *store.Job) {
 	// Capture "was this a fresh asset Create?" before execute can
 	// mutate anything. Used after finalize to drive the post-Create
 	// sweep that catches companions arriving during the Create RPC.
-	isAssetCreate := job.Kind != CompanionJobKind && job.DestID == ""
+	isAssetCreate := job.Kind != CompanionJobKind && job.Kind != EnrichDeleteJobKind && job.DestID == ""
 
 	result, presyncedPaths, err := e.execute(ctx, job, ch, src, dst)
 	if err == nil {
@@ -425,9 +444,13 @@ func (e *Engine) runJob(ctx context.Context, log *slog.Logger, job *store.Job) {
 // staged. Only the job file is cleaned up. The parent asset's sync_log
 // row remains authoritative.
 func (e *Engine) finalize(ctx context.Context, job *store.Job, result jobResult) error {
-	if job.Kind == CompanionJobKind {
+	// Metadata-only jobs (companion PATCH, enrich-delete PATCH) have no
+	// content version to audit and no upload marker to clear — there's
+	// nothing to record in sync_log. Just complete the job file. The
+	// parent/asset's own sync_log row remains authoritative.
+	if job.Kind == CompanionJobKind || job.Kind == EnrichDeleteJobKind {
 		if err := e.store.CompleteJob(ctx, job.ID); err != nil {
-			return fmt.Errorf("complete companion job: %w", err)
+			return fmt.Errorf("complete %s job: %w", job.Kind, err)
 		}
 		return nil
 	}
@@ -440,7 +463,7 @@ func (e *Engine) finalize(ctx context.Context, job *store.Job, result jobResult)
 		SourceConnector: job.SourceConnector,
 		SourcePath:      job.SourcePath,
 		SourceVersion:   job.SourceVersion,
-		DestID:  result.destID,
+		DestID:          result.destID,
 		Kind:            kind,
 	}
 	// Idempotent insert: if the latest sync_log row for this
@@ -501,6 +524,9 @@ func (e *Engine) execute(
 	case CompanionJobKind:
 		res, err := e.executeCompanion(ctx, job)
 		return res, nil, err
+	case EnrichDeleteJobKind:
+		res, err := e.executeEnrichDelete(ctx, job)
+		return res, nil, err
 	case string(connector.EventCreate), string(connector.EventUpdate):
 		srcEntry, err := src.Stat(ctx, job.SourcePath)
 		if err != nil {
@@ -519,6 +545,16 @@ func (e *Engine) execute(
 			}
 		}
 
+		// Enrich scripts derive metadata from the asset itself (path,
+		// size, hash, event kind) with no companion file. They run on
+		// every Create AND Update so path-derived tags stay correct, and
+		// fold into the same Write call as companion fields — one API
+		// call, no separate PATCH.
+		enrichFields, err := e.runEnrichers(ctx, ch, job.SourcePath, srcEntry.Size, srcEntry.Hash, job.DestID, connector.EventKind(job.Kind), false)
+		if err != nil {
+			return jobResult{}, nil, fmt.Errorf("enrich: %w", err)
+		}
+
 		meta := map[string]any{
 			"_job_id":           job.ID,
 			"_channel":          job.ChannelName,
@@ -528,8 +564,8 @@ func (e *Engine) execute(
 		if job.DestID != "" {
 			meta["dest_id"] = job.DestID
 		}
-		if len(companionFields) > 0 {
-			meta["dest_fields"] = companionFields
+		if fields := append(companionFields, enrichFields...); len(fields) > 0 {
+			meta["dest_fields"] = fields
 		}
 		out, err := dst.Write(ctx, job.SourcePath, segSrc, meta)
 		if err != nil {

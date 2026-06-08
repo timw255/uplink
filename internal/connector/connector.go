@@ -42,11 +42,9 @@ type Entry struct {
 type EventKind string
 
 const (
-	EventCreate         EventKind = "OnCreate"
-	EventUpdate         EventKind = "OnUpdate"
-	EventDelete         EventKind = "OnDelete"
-	EventMove           EventKind = "OnMove"
-	EventMetadataChange EventKind = "OnMetadataChange"
+	EventCreate EventKind = "OnCreate"
+	EventUpdate EventKind = "OnUpdate"
+	EventDelete EventKind = "OnDelete"
 )
 
 // Event represents a change observed on a source connector. Poll-based
@@ -62,9 +60,6 @@ type Event struct {
 	// Entry is the post-change entry. For EventDelete, only Path is
 	// guaranteed to be populated.
 	Entry Entry
-
-	// PreviousPath is set for EventMove.
-	PreviousPath string
 
 	// Observed is when the connector detected the event (not when it
 	// happened upstream, which may be unknown).

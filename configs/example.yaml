@@ -95,7 +95,7 @@ channels:
       events: [OnCreate, OnUpdate]
       # Or use `event:` (singular) for a single kind. Exactly one of
       # the two forms must be set. Available kinds: OnCreate, OnUpdate,
-      # OnDelete, OnMove, OnMetadataChange.
+      # OnDelete.
       # filter: 'size > 0'        # optional filter expression
 
     # Optional: declare companion files that contribute metadata to
@@ -112,3 +112,12 @@ channels:
     #     script: ./scripts/xmp.lua
     #   - pattern: "${basename}.caption.${lang}.txt"
     #     script: ./scripts/captions.lua
+
+    # Optional: enrich scripts derive metadata from the asset ITSELF —
+    # no companion file, no pattern. They run on every lifecycle event
+    # the trigger names (folding fields into the Create/Update write, or
+    # PATCHing on delete) and are the way to turn path structure into
+    # fields, e.g. mapping "emea/spring-2026/banner.png" to Region and
+    # Campaign fields. See the README's "Enrich scripts" section.
+    # enrich:
+    #   - script: ./scripts/derive-from-path.lua
