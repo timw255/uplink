@@ -659,7 +659,7 @@ func uploadOptsFromMeta(meta map[string]any) *aprimo.UploadOptions {
 }
 
 // fieldsFromMeta extracts the channel-supplied fields block, resolves
-// companion-script-supplied `name` references to Aprimo `fieldId`s,
+// companion-script-supplied `name` references to Aprimo field `id`s,
 // and wraps values in the localized payload Aprimo expects. The
 // resolver (populated at Init) holds the name→id and culture→id maps.
 //
@@ -669,7 +669,7 @@ func uploadOptsFromMeta(meta map[string]any) *aprimo.UploadOptions {
 //     companion scripts. Resolved + wrapped here.
 //  2. anything else (typically a map) — power-user escape hatch.
 //     Passed through unchanged. Must already match Aprimo's API shape
-//     (fieldId + localizedValues + addOrUpdate/remove envelope).
+//     (id + localizedValues + addOrUpdate/remove envelope).
 //
 // Returns (nil, nil) when there are no fields to write.
 func (c *Connector) fieldsFromMeta(meta map[string]any) (json.RawMessage, error) {

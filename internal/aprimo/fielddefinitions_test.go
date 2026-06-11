@@ -52,6 +52,68 @@ func TestFieldDefinitionsList_SinglePage(t *testing.T) {
 	}
 }
 
+func TestFieldDefinitionsList_NormalizesDataTypeCasing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		// Aprimo emits dataType in PascalCase; List must fold it to the
+		// lowercase form the DataType* constants use.
+		_, _ = fmt.Fprintln(w, `{
+			"items": [
+				{"id": "fld-1", "name": "Keywords", "dataType": "TextList"},
+				{"id": "fld-2", "name": "Department", "dataType": "OptionList"}
+			],
+			"_links": { "self": { "href": "/api/core/fielddefinitions" } }
+		}`)
+	}))
+	defer srv.Close()
+
+	fd := &FieldDefinitions{r: &requester{
+		client:  srv.Client(),
+		auth:    stubAuth("tok"),
+		baseURL: srv.URL,
+		headers: map[string]string{"Accept": "application/hal+json"},
+	}}
+
+	defs, err := fd.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if defs[0].DataType != DataTypeTextList {
+		t.Errorf("defs[0].DataType = %q, want %q", defs[0].DataType, DataTypeTextList)
+	}
+	if defs[1].DataType != DataTypeOptionList {
+		t.Errorf("defs[1].DataType = %q, want %q", defs[1].DataType, DataTypeOptionList)
+	}
+}
+
+func TestFieldDefinitions_GetByID_NormalizesDataTypeCasing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/hal+json")
+		_, _ = fmt.Fprintln(w, `{
+			"id": "fd-1",
+			"name": "Department",
+			"dataType": "OptionList",
+			"items": [{"id": "opt-1", "name": "Marketing"}]
+		}`)
+	}))
+	defer srv.Close()
+
+	fd := &FieldDefinitions{r: &requester{
+		client:  srv.Client(),
+		auth:    stubAuth("tok"),
+		baseURL: srv.URL,
+		headers: map[string]string{"Accept": "application/hal+json"},
+	}}
+
+	got, err := fd.GetByID(context.Background(), "fd-1")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.DataType != DataTypeOptionList {
+		t.Errorf("DataType = %q, want %q", got.DataType, DataTypeOptionList)
+	}
+}
+
 func TestFieldDefinitionsList_FollowsHALNextLinks(t *testing.T) {
 	var hits int32
 	var srv *httptest.Server

@@ -163,8 +163,10 @@ func buildResolver(ctx context.Context, api *aprimo.Client, defaultLanguage stri
 
 // resolveFieldEntries walks the engine's flat field-entry list, looks
 // each name up, dispatches per-type for value coercion + sub-entity
-// resolution, and groups by fieldId so multi-language writes for the
-// same field consolidate into one addOrUpdate entry.
+// resolution, and groups by field id so multi-language writes for the
+// same field consolidate into one addOrUpdate entry. Each entry is
+// keyed by `id` (the field-definition GUID), the property Aprimo's
+// record API requires on every fields.addOrUpdate item.
 func (r *resolver) resolveFieldEntries(entries []any) ([]map[string]any, error) {
 	type acc struct {
 		dataType  string
@@ -217,7 +219,7 @@ func (r *resolver) resolveFieldEntries(entries []any) ([]map[string]any, error) 
 	out := make([]map[string]any, 0, len(order))
 	for _, fid := range order {
 		out = append(out, map[string]any{
-			"fieldId":         fid,
+			"id":              fid,
 			"localizedValues": byField[fid].localized,
 		})
 	}

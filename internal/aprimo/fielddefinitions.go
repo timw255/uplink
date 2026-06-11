@@ -17,8 +17,11 @@ type FieldDefinitions struct {
 	r *requester
 }
 
-// Field DataType constants. These match the lowercase discriminator
-// values Aprimo emits on each FieldDefinition response.
+// Field DataType constants. These are the canonical lowercase
+// discriminator values. Aprimo's API emits dataType in PascalCase
+// (e.g. "TextList", "OptionList"); normalizeDataType lowercases each
+// value at the decode boundary so every consumer can compare against
+// these constants directly.
 const (
 	DataTypeSingleLineText    = "singlelinetext"
 	DataTypeMultiLineText     = "multilinetext"
@@ -101,6 +104,14 @@ type FieldDefinitionDetail struct {
 	OptionListItems []OptionListItem `json:"items,omitempty"`
 }
 
+// normalizeDataType folds Aprimo's PascalCase dataType discriminator
+// (e.g. "TextList") to the canonical lowercase form used by the
+// DataType* constants. Applied at every decode boundary so downstream
+// comparisons need not worry about server-side casing.
+func normalizeDataType(dt string) string {
+	return strings.ToLower(dt)
+}
+
 // GetByID fetches the full definition of a single field by its
 // GUID. Used by the resolver to pull `items` out of OptionList
 // field definitions for name→id resolution.
@@ -109,6 +120,7 @@ func (fd *FieldDefinitions) GetByID(ctx context.Context, id string) (*FieldDefin
 	if err := fd.r.getJSON(ctx, "/api/core/fielddefinition/"+id, nil, &out); err != nil {
 		return nil, fmt.Errorf("aprimo: get field definition %s: %w", id, err)
 	}
+	out.DataType = normalizeDataType(out.DataType)
 	return &out, nil
 }
 
@@ -131,6 +143,9 @@ func (fd *FieldDefinitions) List(ctx context.Context) ([]FieldDefinition, error)
 		var page fieldDefinitionPage
 		if err := fd.r.getJSON(ctx, path, headers, &page); err != nil {
 			return nil, fmt.Errorf("aprimo: list field definitions: %w", err)
+		}
+		for i := range page.Items {
+			page.Items[i].DataType = normalizeDataType(page.Items[i].DataType)
 		}
 		out = append(out, page.Items...)
 		if len(out) > maxFieldDefinitions {

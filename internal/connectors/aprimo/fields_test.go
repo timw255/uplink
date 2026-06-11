@@ -18,7 +18,7 @@ func connectorWithResolver() *Connector {
 
 // TestFieldsFromMeta_ResolvesAndWrapsList confirms the boundary:
 // companion scripts emit `{name, value}` entries; this is where they
-// get translated into Aprimo's `{fieldId, localizedValues:
+// get translated into Aprimo's `{id, localizedValues:
 // [{languageId, value}]}` shape and wrapped in `addOrUpdate`. The
 // resolver dispatches per-type — this test just spot-checks the
 // integration shape.
@@ -49,8 +49,8 @@ func TestFieldsFromMeta_ResolvesAndWrapsList(t *testing.T) {
 		t.Fatalf("expected 2 entries, got %d: %v", len(add), add)
 	}
 	first := add[0].(map[string]any)
-	if first["fieldId"] != "fld-client" {
-		t.Errorf("first.fieldId = %v, want fld-client", first["fieldId"])
+	if first["id"] != "fld-client" {
+		t.Errorf("first.id = %v, want fld-client", first["id"])
 	}
 	firstLV := first["localizedValues"].([]any)[0].(map[string]any)
 	if firstLV["languageId"] != "lang-en" {
@@ -101,14 +101,14 @@ func TestFieldsFromMeta_EmptyListYieldsNil(t *testing.T) {
 // TestFieldsFromMeta_PassThroughPreShapedMap covers power-users who
 // supply dest_fields as a fully-shaped map (e.g., for remove/clear
 // operations not reachable through the {name, value} shape). The map
-// passes through unwrapped — they're responsible for using fieldId +
+// passes through unwrapped — they're responsible for using id +
 // localizedValues themselves.
 func TestFieldsFromMeta_PassThroughPreShapedMap(t *testing.T) {
 	c := connectorWithResolver()
 	preShaped := map[string]any{
 		"addOrUpdate": []any{
 			map[string]any{
-				"fieldId":         "fld-pre",
+				"id":              "fld-pre",
 				"localizedValues": []any{map[string]any{"languageId": "lang-en", "value": "y"}},
 			},
 		},
