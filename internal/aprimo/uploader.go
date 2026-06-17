@@ -8,12 +8,33 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/timw255/uplink/internal/connector"
 )
+
+// InvalidFilenameChars are the characters Aprimo rejects in a filename.
+// A name derived from an arbitrary source path or object key may
+// legitimately contain these (S3/B2/Azure keys are far more permissive
+// than a DAM), so it has to be cleaned before it reaches the upload or
+// record API.
+const InvalidFilenameChars = `<>:"/\|?*`
+
+// SanitizeFilename replaces every character Aprimo disallows in a filename
+// with an underscore. Control characters are also replaced — beyond being
+// rejected, an unescaped CR/LF in a multipart filename header would be a
+// header-injection vector. Ordinary names pass through untouched.
+func SanitizeFilename(name string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || strings.ContainsRune(InvalidFilenameChars, r) {
+			return '_'
+		}
+		return r
+	}, name)
+}
 
 // Uploader implements Aprimo's segmented file-upload protocol.
 //
@@ -164,6 +185,37 @@ func (u *Uploader) UploadFromSource(
 		return u.uploadSmall(ctx, src, filename)
 	}
 	return u.uploadSegmented(ctx, src, filename, size, opts)
+}
+
+// DirectUpload is the response to a direct-to-storage upload request. The
+// bytes are uploaded straight to the returned SASURL (a pre-authorized,
+// writable Azure Blob URL) instead of streamed through Aprimo's upload
+// service, so the transfer never touches the rate-limited Aprimo API.
+// Token references the uploaded file in the record APIs — but only AFTER
+// the blob upload has finished.
+type DirectUpload struct {
+	Token  string `json:"token"`
+	SASURL string `json:"sasUrl"`
+}
+
+// CreateDirectUpload asks Aprimo for a direct-to-storage upload slot: a
+// SAS URL to upload the bytes to and a token to reference them with. This
+// is a single Aprimo API call (one rate-limit token); the bytes go
+// straight to blob storage out-of-band. The caller uploads to SASURL,
+// then passes Token to Records.Create/Update — see the connector's direct
+// path for the orchestration.
+func (u *Uploader) CreateDirectUpload(ctx context.Context, filename string) (*DirectUpload, error) {
+	if filename == "" {
+		return nil, &Error{Message: "uploader: filename is required", Cause: ErrUpload}
+	}
+	var out DirectUpload
+	if err := u.r.postJSON(ctx, "/uploads", map[string]any{"fileName": filename}, &out, nil); err != nil {
+		return nil, wrapUpload("uploader: create direct upload", err)
+	}
+	if out.Token == "" || out.SASURL == "" {
+		return nil, &Error{Message: "uploader: direct upload response missing token or sasUrl", Cause: ErrUpload}
+	}
+	return &out, nil
 }
 
 func (u *Uploader) uploadSmall(ctx context.Context, src connector.SegmentSource, filename string) (*UploadResult, error) {
@@ -467,6 +519,22 @@ func (u *Uploader) cleanupCancelledUpload(uploadPath string) error {
 	return u.cancelUpload(ctx, uploadPath)
 }
 
+// copyBufSize is the buffer the multipart pump copies through. 1 MiB is
+// well past the point of diminishing syscall returns for any segment
+// size; larger just wastes pooled memory.
+const copyBufSize = 1 << 20
+
+// copyBufPool recycles copy buffers across uploads so concurrent segments
+// and the many small single-shot uploads of a bulk import reuse memory
+// instead of churning the GC. Buffers are returned by pointer to avoid
+// the per-Put slice-header allocation.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, copyBufSize)
+		return &b
+	},
+}
+
 // streamMultipart builds an io.ReadCloser that lazily produces a
 // multipart body wrapping `src`. Memory use is bounded by the
 // io.Pipe internal buffer (~64 KiB) instead of the full segment size.
@@ -495,7 +563,15 @@ func streamMultipart(fieldName, filename string, src io.ReadCloser) (io.ReadClos
 			err = perr
 			return
 		}
-		if _, cerr := io.Copy(part, src); cerr != nil {
+		// Copy through a large pooled buffer rather than io.Copy's 32 KiB
+		// default: it cuts source reads and io.Pipe handoffs (and their
+		// goroutine wakeups) by ~30x on a 20 MiB segment. Pooled so the
+		// thousands of small single-shot uploads in a bulk import don't
+		// each allocate a megabyte.
+		bufp := copyBufPool.Get().(*[]byte)
+		_, cerr := io.CopyBuffer(part, src, *bufp)
+		copyBufPool.Put(bufp)
+		if cerr != nil {
 			err = cerr
 			return
 		}
@@ -513,9 +589,9 @@ func streamMultipart(fieldName, filename string, src io.ReadCloser) (io.ReadClos
 // the HTTP layer abandons an in-flight body on 429 it must release
 // the source connector's range-read handle, not leave it dangling.
 type streamingBody struct {
-	pr  *io.PipeReader
-	src io.ReadCloser
-	mu  sync.Mutex
+	pr   *io.PipeReader
+	src  io.ReadCloser
+	mu   sync.Mutex
 	done bool
 }
 

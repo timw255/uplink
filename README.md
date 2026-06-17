@@ -261,9 +261,23 @@ The Aprimo DAM. Always the destination; never used as a source.
                                     # + socket-pool safety net independent of `rps`.
                                     # 0 (default) = uncapped.
     http_timeout: "60s"             # SDK request timeout
+    direct_upload: true             # upload file bytes straight to Aprimo's
+                                    # Azure Blob storage via a SAS URL, off the
+                                    # rate-limited API. Default true; see below.
 ```
 
-Authenticates via the `client_credentials` OAuth flow. Upload sessions are segmented for files larger than 20 MiB; see [If the daemon crashes mid-sync](#if-the-daemon-crashes-mid-sync) for what happens when an upload is interrupted.
+Authenticates via the `client_credentials` OAuth flow.
+
+#### Direct-to-blob uploads
+
+Aprimo's storage is Azure Blob, and its upload API can hand back a short-lived, writable **SAS URL** pointing straight at the backing blob. With `direct_upload: true` (the default), Uplink uploads file bytes **directly to that blob URL** — using the same block-parallel protocol AzCopy uses, via the Azure SDK already in the binary (no external tools) — instead of streaming them through Aprimo's HTTP upload service.
+
+Two things make this a big win for upload-heavy work:
+
+- **It bypasses the rate limiter.** The bytes never hit the Aprimo API, so a large file costs **one** request against your `rps` budget (to mint the SAS) plus the record write — not dozens of segment POSTs. Your whole RPS budget is freed for metadata, and the adaptive worker pool fills your bandwidth instead of pacing against the token bucket.
+- **Azure ingests at full line rate.** Throughput is bounded by your pipe, not Aprimo's proxy.
+
+Set `direct_upload: false` to route uploads through Aprimo's segmented upload service instead — a kill-switch for tenants where the direct path misbehaves. Either way, an interrupted upload re-streams the file on the next attempt and the record is created exactly once — see [If the daemon crashes mid-sync](#if-the-daemon-crashes-mid-sync).
 
 At startup (and again on every `refresh_interval` tick) the connector prefetches the tenant's field-definition, language, classification, option-item, user, and user-group catalogs so companion scripts can reference everything by display name without ever touching opaque GUIDs. New fields added in Aprimo become visible at the next refresh; renamed fields likewise. If `refresh_interval: 0s`, restart the daemon to pick up changes.
 
@@ -645,15 +659,21 @@ The `engine:` block at the top level of `uplink.yaml` controls the worker pool a
 
 ```yaml
 engine:
-  workers: 8              # how many jobs run concurrently
+  workers: 32             # OPTIONAL: pin a fixed pool, disabling auto-scaling (see below)
   poll_idle: "500ms"      # how long workers sleep when there's no claimable job
   max_attempts: 5         # max retries before a job lands in failed
   base_backoff: "2s"      # initial retry delay; doubles each attempt, capped at 5m
 ```
 
-When to bump each:
+### Worker concurrency is automatic
 
-- **`workers`** (default 4): the headline knob. Each worker runs one job at a time — Stat + Read + segmented Write + record create/update. Bumping it raises throughput linearly until something else becomes the bottleneck (Aprimo's rate limit, source bandwidth, disk on localfs). 8–16 is a reasonable starting point for production; 32 is aggressive. Pair with the Aprimo connector's `max_concurrent` cap so retries can't cause a stampede.
+You don't set a worker count for throughput. As long as a destination has `rps` configured (the normal case), the engine **auto-scales the number of concurrent jobs** to keep the Aprimo rate limiter saturated — the same adaptive pool the [bulk importer](#speed) uses. It watches how hard the limiter is actually being driven and grows the pool under a backlog, holds once it's running at the licensed `rps`, and shrinks back when the queue goes idle. A burst of big files ramps up to many concurrent uploads; a trickle of small ones settles low. The `rps` token bucket is a hard ceiling, so more workers can never exceed your tenant's rate — they only stop you from *under*-driving it.
+
+Because the work is network I/O end to end (Stat + read + segmented upload + record write — almost no CPU), the pool is **not** bounded by core count. Its ceiling is a memory/socket safety bound, taken from the destination's `max_concurrent` (or 64 when that's uncapped). That's the number to raise if you want to let it run wider.
+
+When to set each knob:
+
+- **`workers`** (optional): set it to **pin a fixed pool** of exactly this many concurrent jobs and turn auto-scaling **off** — useful when you want deterministic, predictable concurrency instead of letting the engine size itself. Leave it unset for the auto-scaling default. (If **no** destination has `rps` configured there's no rate signal to scale against, so the engine runs a fixed pool of `workers` jobs, default 4, either way.)
 
 - **`poll_idle`** (default 500ms): how long a worker waits between `ClaimNextJob` attempts when nothing's ready. Lower = more responsive on the first event after an idle period, higher = less SQLite traffic. 500ms is fine for almost everything. Drop to 100ms only if you measurably need faster pickup.
 
@@ -681,6 +701,7 @@ uplink retry    --id=ID | --channel=N | --all              # re-enqueue failed j
 uplink inspect  sync   --path=P --channel=C                # latest sync_log row for a key
 uplink inspect  state  --connector=N                       # connector state blob
 uplink inspect  upload --job=ID                            # in-flight upload marker
+uplink import   --file=M.jsonl [--dry-run]                 # bulk-load a JSONL manifest into Aprimo
 uplink archive  --older-than=DUR [--out=DIR | --discard]   # prune old sync_log rows
 uplink version
 ```
@@ -690,3 +711,84 @@ uplink version
 ## If the daemon crashes mid-sync
 
 Restart it. Each in-flight upload has a marker file in `data/uploads/`; the next claim picks up from where it left off — committed segments are not re-sent and records are not duplicated. `uplink inspect upload --job=<id>` prints any marker that's still in flight.
+
+
+## Bulk import
+
+The daemon is built for the steady state — files landing in a watched backend, one at a time, forever. A bulk import is the opposite shape: a one-shot batch you want in Aprimo now. Maybe you're migrating a pile of assets with an export of their metadata; maybe you're uploading 200k new files in one go, or stamping metadata across thousands of records that already exist. Same path either way. `uplink import` reads a JSONL manifest (one record per line) and, for each line, either creates a new record from an uploaded file, attaches a new file version to an existing record, or patches metadata onto an existing record — your choice, per line.
+
+The import command stores state in a per-manifest ledger under the data dir recording which records are already done, so a re-run never uploads the same file twice. See [The ledger](#the-ledger-resume-and-dedup) below.
+
+### The manifest
+
+One JSON object per line (JSONL). Four keys are recognized:
+
+| Key | Meaning |
+|---|---|
+| `id` | An existing Aprimo record id. Present → the line targets that record. |
+| `file` | The asset's path **within the `--source` connector**. Present → its bytes are uploaded. |
+| `status` | Optional lifecycle status: `draft`, `released`, or `archived`. |
+| `fields` | The metadata: a list of `{ "name": ..., "value": ..., "language": ... }` entries — the **same contract** companion and enrich scripts use (see [The contract a script honors](#the-contract-a-script-honors)). `name` is the field's display name in Aprimo; `language` is optional and defaults to the connector's `default_language`. |
+
+What each combination does:
+
+| `id` | `file` | Action |
+|:---:|:---:|---|
+| —   | yes | **Create** a new record from the uploaded file, applying `fields`. |
+| yes | yes | **Update**: upload the file as a new version on that record, applying `fields`. |
+| yes | —   | **Metadata** only: PATCH `fields` (and/or `status`) onto the existing record — no upload. |
+| —   | —   | Error — a line needs at least one of `id` or `file`. |
+
+```json
+{"file": "photos/sunset.jpg", "fields": [{"name": "Title", "value": "Sunset on Mt. Hood"}]}
+{"id": "6892d77eb0d145a59a31b2be0127bc97", "file": "photos/hero.jpg", "status": "released"}
+{"id": "cf91775e283644c798f4b2be0127bca2", "fields": [{"name": "Caption", "value": "Coucher de soleil", "language": "fr-FR"}]}
+```
+
+Unknown top-level keys are **rejected** by default — so a raw export with extra columns (`title`, `contentType`, `modifiedOn`, …) fails loudly, reminding you to move the ones you actually want into a `fields` array. Pass `--lenient` to ignore extra keys instead. Values inside `fields` are coerced per the field's Aprimo data type exactly as in a companion script: a `Numeric` field takes a JSON number, a `TextList` a JSON array of strings, a `ClassificationList` a path like `"Topics/Sports/Football"`, and so on — see [Supported field types](#supported-field-types).
+
+### Dry run first
+
+```sh
+uplink import --file=records.jsonl --source=fs-in --dry-run
+```
+
+A dry run validates every line without writing anything: it confirms each line has an `id` or a `file`, that any `file` actually exists at its path under `--source`, and that every field resolves against the live Aprimo catalog (field names exist, classifications/option-items/users/languages resolve, values coerce). It still authenticates and prefetches the catalog — it just makes no changes. The command exits non-zero if any line fails validation, so it drops straight into an import script or CI gate. Fix the manifest, re-run until clean, then drop `--dry-run`.
+
+Aprimo forbids `< > : " / \ | ? *` (and control characters) in a filename, so on upload Uplink replaces any of them with `_`. The dry run **flags every name it will rewrite** — logged as a warning (`old -> new`) and tallied in the summary as `filenames to be rewritten: N`. The line is still valid; this is just a heads-up so you can spot surprises — `a:b.jpg` and `a/b.jpg` both become `a_b.jpg` — before committing to a large import.
+
+### Running it
+
+```sh
+uplink import --file=records.jsonl --source=fs-in --destination=aprimo-prod
+```
+
+- `--destination` names an `aprimo` connector from your config; the importer reads its credentials, `rps`, and `max_concurrent` straight from that connector's block. When the config defines exactly one aprimo connector, `--destination` can be omitted.
+- `--source` names the connector the `file` paths are resolved against — any source connector (localfs, s3, azblob, b2). It's required only if some line carries a `file`; a metadata-only manifest doesn't need it.
+- `--stop-on-error` aborts on the first failing line. The default processes the whole manifest and reports failures at the end — the usual bulk-import posture.
+
+### The ledger (resume and dedup)
+
+So every import keeps a ledger: one JSONL row per processed record (`{line, hash, action, dest_id, error?}`). By default it lives at:
+
+```
+<data_dir>/imports/<manifest>-<hash>.jsonl
+```
+
+keyed to the (manifest, destination) pair, so re-running the same import against the same Aprimo environment finds the same ledger. On a re-run, any record already recorded as `created`, `updated`, or `metadata` is **skipped** — that's the dedup that stops a crashed or re-issued import from uploading the same file multiple times. Failed and invalid lines are *not* marked done, so they're retried on the next run.
+
+The ledger also records an intermediate `uploaded` state: the moment a file's bytes are in blob storage (with its token) but before the record is created. So if a crash lands in that window — the expensive part already done — **resume skips the re-upload and creates straight from the saved token.** If Aprimo has since swept the upload (it cleans unattached uploads up after a few days), the create simply fails with "upload token missing" and the pipeline re-uploads that one file and retries.
+
+You normally don't touch any of this — just re-run the command and it picks up where it left off. `--restart` is the one knob: it ignores prior progress and re-processes every record from scratch.
+
+A dry run keeps no ledger — it's pure validation with nothing worth persisting.
+
+### Speed
+
+A bulk import pushes against two limits at once: the **Aprimo API** (gated by your licensed `rps`) and your **bandwidth** (carrying the file bytes). The importer saturates both by running uploads and record-writes as decoupled stages with a queue between them — bytes stream straight to Azure blob storage [off the rate limiter](#direct-to-blob-uploads) while records get written at the `rps` pace. A slow multi-gigabyte upload runs in the background and never starves record creation, so you hit the API ceiling instead of stalling behind a transfer.
+
+You normally set none of these: the upload stage auto-scales to fill your bandwidth and the create stage is paced by `rps`, so the system finds the right concurrency on its own. Reach for these only to **override the auto-tuning** — when you need a hard cap because the host is tight on memory or sockets, or you just want fixed, predictable concurrency instead of a pool that grows and shrinks:
+
+- `--upload-concurrency=N` (default 32) — caps how many files upload at once. The auto-tuner never ramps past this; set it low to protect a constrained host, high to push a fat pipe harder. `--max-workers` is an alias.
+- `--create-concurrency=N` (default 16) — caps concurrent record writes. The `rps` limiter already paces these, so this only matters if you want to hold record-writing below your licensed rate.
+

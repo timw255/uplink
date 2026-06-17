@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/timw255/uplink/internal/adaptive"
+	"github.com/timw255/uplink/internal/aprimo"
 	"github.com/timw255/uplink/internal/channel"
 	"github.com/timw255/uplink/internal/connector"
 	"github.com/timw255/uplink/internal/connectors"
@@ -20,6 +22,14 @@ import (
 	"github.com/timw255/uplink/internal/extract"
 	"github.com/timw255/uplink/internal/store"
 )
+
+// rateAware is the slice of the Aprimo connector the daemon needs to
+// drive the engine's adaptive worker pool: read its licensed rate and
+// attach the shared telemetry sink the controller samples.
+type rateAware interface {
+	RateLimit() (rps float64, maxConcurrent int)
+	SetRateObserver(obs aprimo.RateObserver)
+}
 
 // scriptCompiler adapts an *extract.Runtime to channel.ScriptCompiler.
 // Lives here so the channel package stays free of an extract dep —
@@ -33,6 +43,13 @@ func (c scriptCompiler) Compile(name, path string) (channel.CompiledScript, erro
 // defaultConfigName is the filename `uplink run` looks for next to the
 // binary when no --config flag is given.
 const defaultConfigName = "uplink.yaml"
+
+// defaultAdaptiveWorkerCap bounds the adaptive worker pool when neither
+// engine.workers nor any destination's max_concurrent provides a ceiling.
+// The rate limiter is the real speed governor; this just keeps goroutine
+// and socket growth sane on an otherwise-uncapped tenant. Not a CPU bound
+// — the work is network I/O end to end.
+const defaultAdaptiveWorkerCap = 64
 
 // resolveConfigPath returns the config path to load. An explicit --config
 // argument is honored as-is. When the flag is empty, the binary's own
@@ -158,6 +175,50 @@ func runDaemon(args []string, bootstrapLogger *slog.Logger) error {
 		}
 		engineOpts.BaseBackoff = d
 	}
+
+	// Worker-pool sizing. By default (engine.workers unset) the pool
+	// auto-scales to keep the Aprimo rate limiter saturated: attach one
+	// shared telemetry sink to every rate-limited destination, sum their
+	// licensed RPS as the controller's target, and cap the pool by their
+	// in-flight budgets (max_concurrent). Setting engine.workers pins a
+	// fixed pool of that size and turns auto-scaling off entirely. With
+	// no RPS configured anywhere there's no signal to scale against, so
+	// the engine also runs the fixed `workers` pool.
+	autoscale := cfg.Engine.Workers <= 0
+	metrics := &adaptive.Metrics{}
+	var totalRPS float64
+	var derivedCap int
+	for _, cc := range cfg.Connectors {
+		if cc.Type != "aprimo" {
+			continue
+		}
+		conn, ok := pool.Get(cc.Name)
+		if !ok {
+			continue
+		}
+		ra, ok := conn.(rateAware)
+		if !ok {
+			continue
+		}
+		rps, maxConcurrent := ra.RateLimit()
+		if rps > 0 {
+			totalRPS += rps
+			if autoscale {
+				ra.SetRateObserver(metrics)
+			}
+		}
+		derivedCap += maxConcurrent
+	}
+	if autoscale && totalRPS > 0 {
+		maxWorkers := derivedCap
+		if maxWorkers <= 0 {
+			maxWorkers = defaultAdaptiveWorkerCap
+		}
+		engineOpts.MaxWorkers = maxWorkers
+		engineOpts.TargetRPS = totalRPS
+		engineOpts.Metrics = metrics
+	}
+
 	eng := engine.New(st, channels, pool, engineOpts)
 
 	var wg sync.WaitGroup

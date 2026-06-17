@@ -19,13 +19,13 @@ import (
 // fakeAprimo stands up an httptest.Server that mimics just enough of
 // Aprimo's API surface for the connector tests:
 //
-//   POST /uploads/segments    setup
-//   POST /upload/<id>?index=N segment
-//   POST /upload/<id>/commit  final
-//   DELETE /upload/<id>        cancel
-//   POST /api/core/records    create
-//   PUT  /api/core/record/<id> update
-//   DELETE /api/core/record/<id> delete
+//	POST /uploads/segments    setup
+//	POST /upload/<id>?index=N segment
+//	POST /upload/<id>/commit  final
+//	DELETE /upload/<id>        cancel
+//	POST /api/core/records    create
+//	PUT  /api/core/record/<id> update
+//	DELETE /api/core/record/<id> delete
 //
 // Configurable fault injection: a CreateStatus field controls the
 // response code returned by /api/core/records (200 vs 500). A
@@ -37,6 +37,8 @@ type fakeAprimo struct {
 	setupHits       int
 	commitHits      int
 	deleteUploadHit int
+	directHits      int
+	directSAS       string // sasUrl returned by POST /uploads (JSON)
 	segments        map[int][]byte
 	creates         int
 	updates         []string // record ids that received PUT
@@ -95,11 +97,20 @@ func newFakeAprimo(t *testing.T) *fakeAprimo {
 		collectionStatus:   http.StatusOK,
 		createdRecordID:    "rec-new",
 		segmentFailIndices: make(map[int]bool),
+		directSAS:          "https://acct.blob.core.windows.net/c/abc/file?sig=x",
 	}
 	f.uploadPath = "/upload/abc"
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login/connect/token", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"access_token":"tok","expires_in":3600}`))
+	})
+	mux.HandleFunc("/uploads", func(w http.ResponseWriter, _ *http.Request) {
+		// JSON body to /uploads mints a direct-to-blob slot.
+		f.mu.Lock()
+		f.directHits++
+		sas := f.directSAS
+		f.mu.Unlock()
+		_, _ = w.Write([]byte(`{"token":"direct-tok","sasUrl":"` + sas + `"}`))
 	})
 	mux.HandleFunc("/uploads/segments", func(w http.ResponseWriter, _ *http.Request) {
 		f.mu.Lock()
@@ -351,6 +362,147 @@ func TestConnector_WriteCreatesNewRecord(t *testing.T) {
 	}
 }
 
+// recordingBlob is a blobUploader stub that records each direct upload.
+type recordingBlob struct {
+	sas      []string
+	filename []string
+	sizes    []int64
+}
+
+func (b *recordingBlob) Upload(_ context.Context, sasURL string, body connector.SegmentSource, filename string) error {
+	b.sas = append(b.sas, sasURL)
+	b.filename = append(b.filename, filename)
+	b.sizes = append(b.sizes, body.Size())
+	return nil
+}
+
+func TestConnector_WriteDirectUpload(t *testing.T) {
+	fake := newFakeAprimo(t)
+	c, st := newTestConnector(t, fake)
+	blob := &recordingBlob{}
+	c.directUpload = true
+	c.blob = blob
+
+	meta := map[string]any{
+		"_job_id":           "job-d",
+		"_channel":          "ch1",
+		"_source_connector": "fs-in",
+		"_source_version":   "v1",
+	}
+	body := writeBody(makeBytes(4096))
+	entry, err := c.Write(context.Background(), "media/big.psd", body, meta)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if entry.Path != "rec-new" {
+		t.Fatalf("entry.Path = %q, want rec-new", entry.Path)
+	}
+
+	// Direct path: one CreateDirectUpload call, the bytes went to the
+	// blob, the record was created — and the segmented service was never
+	// touched.
+	if fake.directHits != 1 {
+		t.Errorf("direct upload API hits = %d, want 1", fake.directHits)
+	}
+	if fake.setupHits != 0 || fake.commitHits != 0 {
+		t.Errorf("segmented service should be untouched: setup=%d commit=%d", fake.setupHits, fake.commitHits)
+	}
+	if fake.creates != 1 {
+		t.Errorf("record creates = %d, want 1", fake.creates)
+	}
+	if len(blob.sas) != 1 {
+		t.Fatalf("blob upload calls = %d, want 1", len(blob.sas))
+	}
+	if blob.filename[0] != "big.psd" {
+		t.Errorf("blob filename = %q, want big.psd", blob.filename[0])
+	}
+	if !strings.Contains(blob.sas[0], "blob.core.windows.net") {
+		t.Errorf("blob SAS = %q, want an Azure blob URL", blob.sas[0])
+	}
+	if blob.sizes[0] != 4096 {
+		t.Errorf("blob upload size = %d, want 4096", blob.sizes[0])
+	}
+
+	// Marker advanced to created with the direct token's record id.
+	m, _ := st.LoadMarker("job-d")
+	if m == nil || m.State != store.MarkerCreated || m.DestID != "rec-new" {
+		t.Fatalf("marker after direct Write = %+v", m)
+	}
+}
+
+// TestConnector_DirectUploadRejectsNonAzureSAS: if the upload response
+// points the SAS at a non-Azure host (tampered/compromised), the connector
+// must NOT stream the file's bytes there — it falls back to the segmented
+// upload through Aprimo's own API, and the record is still created.
+func TestConnector_DirectUploadRejectsNonAzureSAS(t *testing.T) {
+	fake := newFakeAprimo(t)
+	fake.directSAS = "https://evil.example.com/c/abc/file?sig=x" // not an Azure blob host
+	c, _ := newTestConnector(t, fake)
+	blob := &recordingBlob{}
+	c.directUpload = true
+	c.blob = blob
+
+	meta := map[string]any{
+		"_job_id": "job-evil", "_channel": "ch1",
+		"_source_connector": "fs-in", "_source_version": "v1",
+	}
+	body := writeBody(makeBytes(2048))
+	entry, err := c.Write(context.Background(), "media/x.bin", body, meta)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if entry.Path != "rec-new" {
+		t.Fatalf("entry.Path = %q, want rec-new", entry.Path)
+	}
+	// The security invariant: bytes were NOT streamed to the non-Azure host.
+	if len(blob.sas) != 0 {
+		t.Fatalf("file bytes were streamed to a non-Azure SAS host: %v", blob.sas)
+	}
+	// The upload still succeeded via Aprimo's API and the record was created.
+	if fake.creates != 1 {
+		t.Fatalf("record creates = %d, want 1 (fallback should still create)", fake.creates)
+	}
+}
+
+func TestConnector_UploadOnlyThenCreateFromToken(t *testing.T) {
+	fake := newFakeAprimo(t)
+	c, _ := newTestConnector(t, fake)
+	blob := &recordingBlob{}
+	c.directUpload = true
+	c.blob = blob
+
+	// Stage 1: upload only — bytes go to blob, token comes back, NO record.
+	body := writeBody(makeBytes(4096))
+	token, err := c.UploadOnly(context.Background(), "media/big.psd", body, map[string]any{})
+	if err != nil {
+		t.Fatalf("UploadOnly: %v", err)
+	}
+	if token != "direct-tok" {
+		t.Fatalf("token = %q, want direct-tok", token)
+	}
+	if len(blob.sas) != 1 {
+		t.Fatalf("blob upload calls = %d, want 1", len(blob.sas))
+	}
+	if fake.creates != 0 {
+		t.Fatalf("UploadOnly must not create a record, creates=%d", fake.creates)
+	}
+
+	// Stage 2: create from the token — no upload, just the record.
+	entry, err := c.CreateFromToken(context.Background(), "media/big.psd", token, map[string]any{})
+	if err != nil {
+		t.Fatalf("CreateFromToken: %v", err)
+	}
+	if entry.Path != "rec-new" {
+		t.Fatalf("entry.Path = %q, want rec-new", entry.Path)
+	}
+	if fake.creates != 1 {
+		t.Fatalf("creates = %d, want 1", fake.creates)
+	}
+	if len(blob.sas) != 1 {
+		t.Fatalf("CreateFromToken must not upload again, blob calls=%d", len(blob.sas))
+	}
+}
+
 func TestConnector_WriteUpdatesExistingRecord(t *testing.T) {
 	fake := newFakeAprimo(t)
 	c, _ := newTestConnector(t, fake)
@@ -358,7 +510,7 @@ func TestConnector_WriteUpdatesExistingRecord(t *testing.T) {
 	meta := map[string]any{
 		"_job_id":                  "job-2",
 		"_source_version":          "v2",
-		"dest_id":         "rec-existing",
+		"dest_id":                  "rec-existing",
 		"aprimo_parallel_segments": 2,
 		"aprimo_segment_size":      512,
 	}
@@ -481,10 +633,10 @@ func TestConnector_ResumeFromCreatedShortCircuits(t *testing.T) {
 	// hasn't deleted the marker yet. Write should return the existing
 	// record id without touching Aprimo at all.
 	if err := connStore(t, c).SaveMarker(&store.UploadMarker{
-		JobID:          "job-5",
-		State:          store.MarkerCreated,
-		DestID: "rec-existing-X",
-		Filename:       "x.bin",
+		JobID:    "job-5",
+		State:    store.MarkerCreated,
+		DestID:   "rec-existing-X",
+		Filename: "x.bin",
 	}); err != nil {
 		t.Fatalf("seed marker: %v", err)
 	}
@@ -881,7 +1033,7 @@ func TestConnector_UpdateLooksUpMasterFileAndAddsVersion(t *testing.T) {
 
 	meta := map[string]any{
 		"_job_id":                  "job-update",
-		"dest_id":         "rec-existing",
+		"dest_id":                  "rec-existing",
 		"aprimo_parallel_segments": 1,
 		"aprimo_segment_size":      512,
 	}
@@ -944,7 +1096,7 @@ func TestConnector_UpdateFallsBackWhenNoMasterFile(t *testing.T) {
 
 	meta := map[string]any{
 		"_job_id":                  "job-update-no-master",
-		"dest_id":         "rec-empty",
+		"dest_id":                  "rec-empty",
 		"aprimo_parallel_segments": 1,
 		"aprimo_segment_size":      512,
 	}

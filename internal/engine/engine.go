@@ -24,8 +24,10 @@ import (
 	"math/rand/v2"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/timw255/uplink/internal/adaptive"
 	"github.com/timw255/uplink/internal/channel"
 	"github.com/timw255/uplink/internal/connector"
 	"github.com/timw255/uplink/internal/store"
@@ -65,6 +67,23 @@ type Engine struct {
 	pollIdle    time.Duration
 	maxAttempts int
 	baseBackoff time.Duration
+
+	// Adaptive worker-pool wiring. When metrics != nil and maxWorkers
+	// and targetRPS are set, Run scales the live worker count to keep the
+	// Aprimo rate limiter saturated instead of running a fixed pool. nil
+	// metrics (no destination has rps configured) falls back to the
+	// static `workers` pool.
+	maxWorkers     int
+	targetRPS      float64
+	metrics        *adaptive.Metrics
+	controllerTick time.Duration
+
+	// gate is non-nil only while an adaptive Run is active; workerLoop
+	// acquires a slot from it before each claim. claimMisses counts
+	// empty-queue claim attempts per controller tick, the backlog signal
+	// that tells the controller to shrink the pool when idle.
+	gate        *adaptive.Gate
+	claimMisses atomic.Int64
 }
 
 // Options configures the engine. Zero values use sensible defaults.
@@ -74,6 +93,19 @@ type Options struct {
 	MaxAttempts int
 	BaseBackoff time.Duration
 	Logger      *slog.Logger
+
+	// MaxWorkers caps the adaptive pool (a memory/socket safety bound,
+	// NOT a CPU bound — these workers are network-I/O-bound). 0 disables
+	// adaptive scaling and the engine runs the fixed `Workers` pool.
+	MaxWorkers int
+	// TargetRPS is the aggregate licensed request rate across destination
+	// connectors. >0 (with Metrics) enables adaptive scaling.
+	TargetRPS float64
+	// Metrics is the rate-limiter telemetry sink the controller samples.
+	// The daemon attaches it to every Aprimo destination connector.
+	Metrics *adaptive.Metrics
+	// ControllerTick overrides the adaptive sampling interval (tests).
+	ControllerTick time.Duration
 }
 
 // New constructs an Engine. Workers are not started until Run is called.
@@ -94,14 +126,18 @@ func New(s *store.Store, ch *channel.Registry, c Connectors, opts Options) *Engi
 		opts.Logger = slog.Default()
 	}
 	return &Engine{
-		store:       s,
-		channels:    ch,
-		connectors:  c,
-		logger:      opts.Logger,
-		workers:     opts.Workers,
-		pollIdle:    opts.PollIdle,
-		maxAttempts: opts.MaxAttempts,
-		baseBackoff: opts.BaseBackoff,
+		store:          s,
+		channels:       ch,
+		connectors:     c,
+		logger:         opts.Logger,
+		workers:        opts.Workers,
+		pollIdle:       opts.PollIdle,
+		maxAttempts:    opts.MaxAttempts,
+		baseBackoff:    opts.BaseBackoff,
+		maxWorkers:     opts.MaxWorkers,
+		targetRPS:      opts.TargetRPS,
+		metrics:        opts.Metrics,
+		controllerTick: opts.ControllerTick,
 	}
 }
 
@@ -294,9 +330,44 @@ func (e *Engine) DispatchBatch(ctx context.Context, sourceConnector string, even
 }
 
 // Run starts the worker pool and blocks until ctx is cancelled.
+//
+// With a destination RPS configured (the common case), the pool is
+// adaptive: it spawns MaxWorkers goroutines but a Gate caps how many run
+// at once, and a controller resizes that cap each tick to keep the Aprimo
+// rate limiter saturated under backlog and shrink it back when the queue
+// is idle. Worker count is bounded by MaxWorkers — a memory/socket safety
+// net — never by CPU count, since the work is network I/O end to end and
+// the token bucket is the real speed ceiling. Without an RPS signal it
+// falls back to a fixed pool of `workers`.
 func (e *Engine) Run(ctx context.Context) error {
+	workers := e.workers
+	if e.adaptiveEnabled() {
+		workers = e.maxWorkers
+		initial := min(e.maxWorkers, 4)
+		e.gate = adaptive.NewGate(initial, e.maxWorkers)
+		e.gate.Watch(ctx)
+		ctrl := &adaptive.Controller{TargetRPS: e.targetRPS, MaxLimit: e.maxWorkers, Baseline: 1}
+		go ctrl.Run(ctx, e.gate, e.controllerTick, func() adaptive.Sample {
+			reqs, _, throttles := e.metrics.Sample()
+			// HasBacklog is true when no worker found the queue empty this
+			// tick: every claim attempt got a job, so there is pending
+			// work and the pool may grow. An empty-queue hit (miss>0)
+			// means spare capacity — the pool may shrink.
+			misses := e.claimMisses.Swap(0)
+			return adaptive.Sample{
+				Achieved:   float64(reqs),
+				Throttles:  throttles,
+				HasBacklog: misses == 0,
+			}
+		})
+		e.logger.Info("engine: adaptive worker pool",
+			"max_workers", e.maxWorkers, "target_rps", e.targetRPS)
+	} else {
+		e.logger.Info("engine: fixed worker pool", "workers", workers)
+	}
+
 	var wg sync.WaitGroup
-	for i := 0; i < e.workers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -305,6 +376,12 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	wg.Wait()
 	return nil
+}
+
+// adaptiveEnabled reports whether Run should scale the worker pool to the
+// rate limiter rather than run a fixed-size pool.
+func (e *Engine) adaptiveEnabled() bool {
+	return e.targetRPS > 0 && e.metrics != nil && e.maxWorkers > 0
 }
 
 func (e *Engine) workerLoop(ctx context.Context, id int) {
@@ -316,9 +393,21 @@ func (e *Engine) workerLoop(ctx context.Context, id int) {
 		default:
 		}
 
+		// Adaptive pool: take a slot before claiming. When the controller
+		// has shrunk the limit, surplus workers park here (cheap) instead
+		// of hammering the queue. Released in every path below so a slot
+		// is never held across the idle sleep.
+		if e.gate != nil {
+			if err := e.gate.Acquire(ctx); err != nil {
+				return // ctx cancelled
+			}
+		}
+
 		job, err := e.store.ClaimNextJob(ctx)
 		switch {
 		case errors.Is(err, store.ErrNoJob):
+			e.claimMisses.Add(1)
+			e.releaseGate()
 			select {
 			case <-ctx.Done():
 				return
@@ -326,6 +415,8 @@ func (e *Engine) workerLoop(ctx context.Context, id int) {
 			}
 			continue
 		case err != nil:
+			e.claimMisses.Add(1)
+			e.releaseGate()
 			log.Error("claim failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -336,6 +427,14 @@ func (e *Engine) workerLoop(ctx context.Context, id int) {
 		}
 
 		e.runJob(ctx, log, job)
+		e.releaseGate()
+	}
+}
+
+// releaseGate returns the worker's slot when the adaptive pool is active.
+func (e *Engine) releaseGate() {
+	if e.gate != nil {
+		e.gate.Release()
 	}
 }
 

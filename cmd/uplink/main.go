@@ -4,6 +4,7 @@
 //	uplink status [--data-dir=...]            summary of jobs + sync_log
 //	uplink retry --id|--channel|--all         move failed jobs back to pending
 //	uplink inspect {sync|state|upload} ...    print durable state for a key
+//	uplink import --file=<manifest.jsonl>     bulk-load a JSONL manifest into Aprimo
 //	uplink archive --older-than=<dur>         prune old sync_log rows
 //	uplink version                            print version and exit
 //
@@ -43,6 +44,8 @@ func main() {
 		err = runRetry(args, os.Stdout, os.Stderr)
 	case "inspect":
 		err = runInspect(args, os.Stdout)
+	case "import":
+		err = runImport(args, os.Stdout)
 	case "archive":
 		err = runArchive(args, os.Stdout)
 	case "version", "--version", "-v":
@@ -84,6 +87,7 @@ Subcommands:
   inspect sync --path=P --channel=C          print latest sync_log entry
   inspect state --connector=N                dump connector state blob
   inspect upload --job=ID                    print in-flight upload marker
+  import --file=M.jsonl [--dry-run]          bulk-load a JSONL manifest into Aprimo
   archive --older-than=DUR [--out=D|--discard]  prune old sync_log rows
   version                                    print version and exit
   help                                       print this message`)

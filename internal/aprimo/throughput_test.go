@@ -461,10 +461,10 @@ func TestRateLimiter_PacesRequests(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timing-sensitive; run without -short")
 	}
-	// Tiny RPS so the test is fast and deterministic. Burst = 100
-	// (Aprimo's documented constant); we fire 120 to push past it.
+	// Tiny RPS so the test is fast and deterministic. The bucket starts
+	// empty, so the whole batch is paced — there's no burst to push past.
 	const rps = 20.0
-	const total = 120
+	const total = 40
 
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -483,9 +483,8 @@ func TestRateLimiter_PacesRequests(t *testing.T) {
 	}
 	c.SetTestEndpoints(srv.URL, srv.URL)
 
-	// Fire requests concurrently. The first 100 burn through the
-	// burst instantly; the remaining 20 should be paced at 20/sec,
-	// i.e. ≥ 1 second total.
+	// Fire requests concurrently. With an empty bucket every request is
+	// paced at RPS, so the batch takes about (total-1)/rps.
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < total; i++ {
@@ -502,34 +501,26 @@ func TestRateLimiter_PacesRequests(t *testing.T) {
 	if hits.Load() != total {
 		t.Fatalf("server saw %d hits, want %d", hits.Load(), total)
 	}
-	// Excess past burst = 20 requests at 20/sec ≈ 1 second of pacing.
-	// The token bucket itself is precise, but wall-clock measurement
-	// has real noise: time.Now()'s precision varies by OS, goroutine
-	// scheduling adds a few µs between `start` capture and first
-	// limiter.Wait, and rate.Limiter's internal float64 accumulator
-	// can shave a fraction of a millisecond on the 20th reservation.
-	// CI runners have observed shortfalls of ~0.5ms.
-	//
-	// 20ms tolerance keeps the assertion meaningful — at 21 RPS the
-	// excess would take ~952ms and still fail; at 20.5 RPS ~976ms and
-	// still fails. A "no limiter at all" regression registers as ~0ms
-	// and is caught loudly. We only absorb noise that's indistinguish-
-	// able from the correct rate.
+	// From an empty bucket the k-th token frees at k/rps, so the batch
+	// takes about (total-1)/rps. The bucket is precise; wall-clock has a
+	// little noise (OS clock granularity, goroutine scheduling, the
+	// limiter's float64 accumulator), so absorb 20ms. A "no limiter"
+	// regression registers as ~0ms and is caught loudly.
 	const tolerance = 20 * time.Millisecond
-	expected := time.Duration(float64(total-AprimoBurst) / rps * float64(time.Second))
+	expected := time.Duration(float64(total-1) / rps * float64(time.Second))
 	minExpected := expected - tolerance
 	if elapsed < minExpected {
-		t.Fatalf("elapsed = %v, want at least %v (expected ~%v, tolerance %v; token bucket should have paced past burst)",
+		t.Fatalf("elapsed = %v, want at least %v (expected ~%v, tolerance %v; the token bucket should pace the whole batch from empty)",
 			elapsed, minExpected, expected, tolerance)
 	}
-	t.Logf("%d requests at RPS=%v + burst=%d completed in %v (expected ≈%v)", total, rps, AprimoBurst, elapsed, expected)
+	t.Logf("%d requests at RPS=%v completed in %v (expected ≈%v)", total, rps, elapsed, expected)
 }
 
-// TestRateLimiter_BurstAllowsFastStart confirms that when the bucket
-// is full (start of operation), the first AprimoBurst requests fire
-// immediately. Otherwise the limiter is so conservative it's worse
-// than no limiter at all.
-func TestRateLimiter_BurstAllowsFastStart(t *testing.T) {
+// TestRateLimiter_StartsEmpty confirms the client does not front-load the
+// tenant's shared server-side burst buffer at startup: a batch smaller
+// than AprimoBurst is paced at RPS rather than firing all at once. A
+// full-bucket regression would send them instantly and finish near-zero.
+func TestRateLimiter_StartsEmpty(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timing-sensitive; run without -short")
 	}
@@ -538,19 +529,18 @@ func TestRateLimiter_BurstAllowsFastStart(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
+	const rps = 20.0
+	const n = 30 // < AprimoBurst, so a full bucket would fire these instantly
 	c, err := New(Config{
 		Environment:   "trial",
 		TokenProvider: stubAuth("tok"),
-		RPS:           1, // crazy slow; only burst lets us send anything fast
+		RPS:           rps,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	c.SetTestEndpoints(srv.URL, srv.URL)
 
-	// Fire exactly burst-sized batch. Should complete almost instantly
-	// because the bucket starts full.
-	const n = AprimoBurst
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -563,13 +553,14 @@ func TestRateLimiter_BurstAllowsFastStart(t *testing.T) {
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
-	// Allow generous slack — this just confirms we didn't get stuck
-	// waiting for rps=1 tokens. 100 requests at 1 rps would take
-	// 100 seconds; the burst should bring it down to seconds.
-	if elapsed > 5*time.Second {
-		t.Fatalf("burst-sized batch took %v; should have used the full burst capacity", elapsed)
+
+	const tolerance = 20 * time.Millisecond
+	expected := time.Duration(float64(n-1) / rps * float64(time.Second))
+	if elapsed < expected-tolerance {
+		t.Fatalf("%d requests took %v; want at least %v — the bucket must start empty and pace, not front-load the burst",
+			n, elapsed, expected-tolerance)
 	}
-	t.Logf("%d burst-sized requests at RPS=1 completed in %v", n, elapsed)
+	t.Logf("%d requests at RPS=%v paced from empty in %v (expected ≈%v)", n, rps, elapsed, expected)
 }
 
 // TestRateLimiter_NoLimiterWhenRPSIsZero confirms the default

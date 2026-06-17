@@ -17,8 +17,8 @@ type Config struct {
 	// ClientID / ClientSecret authenticate via client_credentials.
 	// They may be supplied directly OR via the *Env fields, which
 	// take precedence and resolve from process environment variables.
-	ClientID     string
-	ClientSecret string
+	ClientID        string
+	ClientSecret    string
 	ClientIDEnv     string
 	ClientSecretEnv string
 
@@ -32,6 +32,13 @@ type Config struct {
 
 	// HTTPTimeout for outbound API calls. Defaults to 60s.
 	HTTPTimeout time.Duration
+
+	// DirectUpload sends file bytes straight to Aprimo's Azure Blob
+	// storage via a SAS URL, bypassing the rate-limited Aprimo upload
+	// service — far faster for large files and it frees the RPS budget
+	// for metadata. Defaults to true. Set false to force the segmented
+	// upload service (a kill-switch if a tenant's direct path misbehaves).
+	DirectUpload bool
 
 	// DefaultLanguage is the IETF culture tag (e.g., "en-US") used for
 	// companion-script-produced field values that don't specify a
@@ -78,6 +85,7 @@ func loadConfig(name string, raw map[string]any) (*Config, error) {
 		DefaultStatus:   "draft",
 		HTTPTimeout:     60 * time.Second,
 		RefreshInterval: 1 * time.Hour,
+		DirectUpload:    true,
 	}
 
 	if v, ok := raw["environment"].(string); ok {
@@ -100,6 +108,9 @@ func loadConfig(name string, raw map[string]any) (*Config, error) {
 	}
 	if v, ok := raw["default_collection"].(string); ok {
 		cfg.DefaultCollection = v
+	}
+	if v, ok := raw["direct_upload"].(bool); ok {
+		cfg.DirectUpload = v
 	}
 	if v, ok := raw["http_timeout"].(string); ok {
 		d, err := connector.ParseDuration(v)

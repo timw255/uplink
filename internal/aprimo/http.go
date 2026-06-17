@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -36,6 +37,55 @@ type requester struct {
 	// rate. nil = no rate limiting (the request layer relies solely
 	// on 429-retry).
 	limiter *rate.Limiter
+
+	// obs is the shared rate-limiter telemetry sink. May be nil when a
+	// requester is constructed directly in a test; New always wires a
+	// non-nil holder. The holder itself may carry a nil observer.
+	obs *observerHolder
+}
+
+// RateObserver receives lightweight, allocation-free telemetry about the
+// rate limiter. All methods are called on the request hot path and must
+// be cheap and safe for concurrent use. A nil observer disables the
+// instrumentation entirely (zero overhead).
+type RateObserver interface {
+	// ObserveWait reports how long a request blocked acquiring a rate
+	// limiter token. ~0 means the bucket was not the bottleneck.
+	ObserveWait(d time.Duration)
+	// ObserveRequest reports that one request attempt completed (any
+	// outcome — 2xx, error, or retryable status).
+	ObserveRequest()
+	// Observe429 reports that a 429 Too Many Requests response was seen.
+	Observe429()
+}
+
+// observerHolder guards swap-in/swap-out of the active RateObserver so it
+// can be attached after client construction without a data race. The
+// RWMutex cost is negligible against an HTTP round-trip.
+type observerHolder struct {
+	mu  sync.RWMutex
+	obs RateObserver
+}
+
+func (h *observerHolder) load() RateObserver {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.obs
+}
+
+func (h *observerHolder) store(o RateObserver) {
+	h.mu.Lock()
+	h.obs = o
+	h.mu.Unlock()
+}
+
+// observer returns the requester's active observer, or nil when no
+// holder is wired or none has been set.
+func (r *requester) observer() RateObserver {
+	if r.obs == nil {
+		return nil
+	}
+	return r.obs.load()
 }
 
 // getJSON, postJSON, putJSON, deleteJSON decode the response body into
@@ -119,9 +169,17 @@ func (r *requester) do(
 		// which is the right call: the server-side bucket also drains
 		// on a request that got 429-rejected. Pacing retries through
 		// the limiter avoids a retry-storm right after the bucket
-		// drains.
+		// drains. The time spent blocked here is the key signal an
+		// adaptive driver uses to tell "limiter saturated" (long wait)
+		// from "limiter starved, add workers" (~0 wait).
+		obs := r.observer()
 		if r.limiter != nil {
-			if err := r.limiter.Wait(ctx); err != nil {
+			waitStart := time.Now()
+			err := r.limiter.Wait(ctx)
+			if obs != nil {
+				obs.ObserveWait(time.Since(waitStart))
+			}
+			if err != nil {
 				if reqCloser != nil {
 					_ = reqCloser.Close()
 				}
@@ -144,6 +202,12 @@ func (r *requester) do(
 		resp, err := r.client.Do(req)
 		if r.sem != nil {
 			<-r.sem
+		}
+		if obs != nil {
+			obs.ObserveRequest()
+			if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+				obs.Observe429()
+			}
 		}
 		// client.Do consumes (or partially consumes) reqReader. We
 		// still close our handle so streaming bodies release any

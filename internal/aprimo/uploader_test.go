@@ -121,6 +121,58 @@ func (s *uploadStub) handler(t *testing.T) http.Handler {
 	return mux
 }
 
+func TestCreateDirectUpload(t *testing.T) {
+	var gotFileName string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/uploads" || r.Method != http.MethodPost {
+			http.Error(w, "unexpected", http.StatusNotFound)
+			return
+		}
+		var body struct {
+			FileName string `json:"fileName"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotFileName = body.FileName
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"token":"tok-123","sasUrl":"https://acct.blob.core.windows.net/c/abc/bigfile.psd?sig=x"}`))
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{Environment: "env", TokenProvider: stubAuth("tok"), HTTPClient: srv.Client()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.mo.baseURL = srv.URL
+
+	du, err := c.Uploader.CreateDirectUpload(context.Background(), "bigfile.psd")
+	if err != nil {
+		t.Fatalf("CreateDirectUpload: %v", err)
+	}
+	if gotFileName != "bigfile.psd" {
+		t.Errorf("fileName sent = %q, want bigfile.psd", gotFileName)
+	}
+	if du.Token != "tok-123" || du.SASURL == "" {
+		t.Fatalf("DirectUpload = %+v", du)
+	}
+}
+
+func TestCreateDirectUploadMissingSAS(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"t"}`)) // no sasUrl — should error
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{Environment: "env", TokenProvider: stubAuth("tok"), HTTPClient: srv.Client()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.mo.baseURL = srv.URL
+
+	if _, err := c.Uploader.CreateDirectUpload(context.Background(), "f.bin"); err == nil {
+		t.Fatal("expected an error when sasUrl is missing")
+	}
+}
+
 func TestUploaderSingleShot(t *testing.T) {
 	s := &uploadStub{}
 	srv := httptest.NewServer(s.handler(t))

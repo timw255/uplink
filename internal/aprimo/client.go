@@ -65,6 +65,15 @@ type Config struct {
 	// triggering 429 under normal load — the retry path is reserved
 	// for genuine transient failures.
 	RPS float64
+
+	// RateObserver, when non-nil, receives lightweight telemetry about
+	// the rate limiter: time spent blocked acquiring a token, every
+	// completed request attempt, and every observed 429. It lets a
+	// bulk-import driver size its worker pool adaptively to keep the
+	// limiter saturated without overshooting. nil in the daemon — the
+	// instrumentation is skipped entirely when unset. The observer can
+	// also be attached after construction via Client.SetRateObserver.
+	RateObserver RateObserver
 }
 
 // AprimoBurst is the documented Aprimo burst-buffer capacity. The
@@ -76,12 +85,17 @@ const AprimoBurst = 100
 // Client is the entry point. Construct via New, then use the resource
 // fields (Records, Uploader, ...).
 type Client struct {
-	cfg     Config
-	auth    TokenProvider
-	dam     *requester
-	mo      *requester
-	damURL  string
-	moURL   string
+	cfg    Config
+	auth   TokenProvider
+	dam    *requester
+	mo     *requester
+	damURL string
+	moURL  string
+
+	// obs is the shared rate-limiter telemetry sink, referenced by both
+	// requesters. Always non-nil after New; holds a nil observer until
+	// one is configured (via Config.RateObserver or SetRateObserver).
+	obs *observerHolder
 
 	Uploader         *Uploader
 	Records          *Records
@@ -91,6 +105,14 @@ type Client struct {
 	Classifications  *Classifications
 	Users            *Users
 	UserGroups       *UserGroups
+}
+
+// SetRateObserver attaches (or replaces) the rate-limiter telemetry sink
+// after construction. Safe to call concurrently with in-flight requests.
+// Pass nil to detach. Used by the import command's adaptive scheduler;
+// the daemon never calls this.
+func (c *Client) SetRateObserver(obs RateObserver) {
+	c.obs.store(obs)
 }
 
 // New constructs a Client.
@@ -144,10 +166,25 @@ func New(cfg Config) (*Client, error) {
 
 	// One shared rate limiter for the same reason: Aprimo's
 	// server-side token bucket is one-per-tenant, not one-per-host.
+	//
+	// The bucket starts empty (drained at construction) so the client
+	// paces at RPS from the first request and never front-loads the
+	// tenant's shared server-side burst buffer. Burst capacity stays
+	// AprimoBurst, so tokens earned back during idle periods remain
+	// available for incidental bursts.
 	var limiter *rate.Limiter
 	if cfg.RPS > 0 {
 		limiter = rate.NewLimiter(rate.Limit(cfg.RPS), AprimoBurst)
+		limiter.AllowN(time.Now(), AprimoBurst)
 	}
+
+	// One shared telemetry holder so an observer set on the Client
+	// reaches every request regardless of which base URL it targets.
+	obs := &observerHolder{}
+	if cfg.RateObserver != nil {
+		obs.store(cfg.RateObserver)
+	}
+	c.obs = obs
 
 	c.dam = &requester{
 		client:  cfg.HTTPClient,
@@ -161,6 +198,7 @@ func New(cfg Config) (*Client, error) {
 		maxRetries: cfg.MaxRetries,
 		sem:        sem,
 		limiter:    limiter,
+		obs:        obs,
 	}
 	c.mo = &requester{
 		client:  cfg.HTTPClient,
@@ -172,6 +210,7 @@ func New(cfg Config) (*Client, error) {
 		maxRetries: cfg.MaxRetries,
 		sem:        sem,
 		limiter:    limiter,
+		obs:        obs,
 	}
 
 	c.Uploader = &Uploader{r: c.mo}
@@ -204,6 +243,12 @@ func tunedHTTPTransport() *http.Transport {
 	t.MaxConnsPerHost = 0 // unlimited; semaphore caps via MaxConcurrent
 	t.IdleConnTimeout = 90 * time.Second
 	t.ForceAttemptHTTP2 = true
+	// Segment uploads are write-heavy; the stdlib default 4 KiB socket
+	// write buffer turns a 20 MiB segment into thousands of write
+	// syscalls. 256 KiB batches them down to dozens. This is syscall
+	// batching only — the OS auto-tunes the actual TCP send window to the
+	// link, so the value is intentionally fixed, not bandwidth-derived.
+	t.WriteBufferSize = 256 * 1024
 	// ExpectContinueTimeout default is fine; segment POSTs don't use
 	// Expect: 100-continue. Tighten DialContext default Timeout so a
 	// dead endpoint fails fast (default is 30s which is reasonable for

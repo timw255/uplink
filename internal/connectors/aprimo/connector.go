@@ -47,6 +47,13 @@ type Connector struct {
 	api   *aprimo.Client
 	store markerStore // set by Pool via UseStore
 
+	// blob uploads file bytes straight to Aprimo's Azure Blob storage via
+	// the SAS the upload API returns, bypassing the rate-limited Aprimo
+	// upload service. nil disables the direct path (used by tests that
+	// exercise the segmented uploader). directUpload gates it on top.
+	blob         blobUploader
+	directUpload bool
+
 	// resolver is updated atomically by the background refresh
 	// goroutine so callers always see a consistent catalog snapshot.
 	resolver atomic.Pointer[resolver]
@@ -75,9 +82,11 @@ func Factory(name string, raw map[string]any) (connector.Connector, error) {
 		return nil, err
 	}
 	return &Connector{
-		name: name,
-		cfg:  cfg,
-		api:  api,
+		name:         name,
+		cfg:          cfg,
+		api:          api,
+		blob:         newAzureBlobUploader(),
+		directUpload: cfg.DirectUpload,
 	}, nil
 }
 
@@ -202,10 +211,7 @@ func (c *Connector) Write(
 	body connector.SegmentSource,
 	meta map[string]any,
 ) (connector.Entry, error) {
-	filename := path.Base(srcPath)
-	if filename == "" || filename == "." || filename == "/" {
-		filename = "upload"
-	}
+	filename := c.filenameFor(srcPath)
 
 	jobID, _ := meta["_job_id"].(string)
 	preferredRecordID, _ := meta["dest_id"].(string)
@@ -241,12 +247,11 @@ func (c *Connector) Write(
 		return c.entryFor(recordID, body.Size(), filename), nil
 	}
 
-	// Otherwise: do the upload (fresh or resumed). upload() owns the
-	// marker — it loads/creates one if needed, drives the on-disk
-	// transitions through the uploader callbacks, and returns the
-	// committed marker so we can advance it to "created" after the
-	// record write.
-	token, postUploadMarker, err := c.upload(ctx, body, filename, marker, jobID, srcPath, meta)
+	// Otherwise: do the upload (fresh or resumed). The chosen path owns
+	// the marker — it loads/creates one if needed, drives the on-disk
+	// transitions, and returns the committed marker so we can advance it
+	// to "created" after the record write.
+	token, postUploadMarker, err := c.uploadBytes(ctx, body, filename, marker, jobID, srcPath, meta)
 	if err != nil {
 		if errors.Is(err, aprimo.ErrUploadTokenMissing) {
 			// A resumed segmented session referenced a token Aprimo had
@@ -273,6 +278,56 @@ func (c *Connector) Write(
 	return c.entryFor(recordID, body.Size(), filename), nil
 }
 
+// filenameFor derives the Aprimo filename from a source path: the base
+// name, defaulted when empty, with characters Aprimo forbids
+// (< > : " / \ | ? *) replaced — or Aprimo rejects the upload/record.
+func (c *Connector) filenameFor(srcPath string) string {
+	filename := path.Base(srcPath)
+	if filename == "" || filename == "." || filename == "/" {
+		filename = "upload"
+	}
+	return aprimo.SanitizeFilename(filename)
+}
+
+// UploadOnly streams a file's bytes to Aprimo storage (direct-to-blob
+// when enabled) and returns the upload token WITHOUT creating a record.
+// It is the upload half of the import pipeline's two stages: uploads run
+// ahead, in the background, decoupled from the rate-limited record
+// creation so a slow upload never throttles the create rate. No marker is
+// kept — the import path is stateless, and a record that never gets
+// created just re-uploads on a later run (tokens are cleaned up server-
+// side after a few days anyway).
+func (c *Connector) UploadOnly(
+	ctx context.Context,
+	srcPath string,
+	body connector.SegmentSource,
+	meta map[string]any,
+) (string, error) {
+	filename := c.filenameFor(srcPath)
+	token, _, err := c.uploadBytes(ctx, body, filename, nil, "", srcPath, meta)
+	if err != nil {
+		return "", fmt.Errorf("aprimo[%s]: upload %s: %w", c.name, filename, err)
+	}
+	return token, nil
+}
+
+// CreateFromToken creates (or, with meta["dest_id"], updates) a record
+// from an already-uploaded token — the create half of the pipeline. The
+// returned Entry carries the record id.
+func (c *Connector) CreateFromToken(
+	ctx context.Context,
+	srcPath, token string,
+	meta map[string]any,
+) (connector.Entry, error) {
+	filename := c.filenameFor(srcPath)
+	preferredRecordID, _ := meta["dest_id"].(string)
+	recordID, err := c.applyRecord(ctx, token, filename, preferredRecordID, meta)
+	if err != nil {
+		return connector.Entry{}, fmt.Errorf("aprimo[%s]: create record %s: %w", c.name, filename, err)
+	}
+	return c.entryFor(recordID, 0, filename), nil
+}
+
 // resetUploadForRetry drops the upload marker so the next worker claim
 // runs a fresh upload + record-create. Called when Aprimo has purged
 // the upload behind a stale token — there is no way to recover the
@@ -297,10 +352,104 @@ func (c *Connector) entryFor(recordID string, size int64, filename string) conne
 		Size:    size,
 		ModTime: time.Now().UTC(),
 		Metadata: map[string]any{
-			"dest_id": recordID,
-			"filename":         filename,
+			"dest_id":  recordID,
+			"filename": filename,
 		},
 	}
+}
+
+// uploadBytes gets the file's bytes to Aprimo and returns a usable upload
+// token. It prefers the direct-to-blob path (bytes go straight to Azure
+// storage, off the rate-limited Aprimo API); without it — disabled by
+// config or a missing blob uploader in tests — it falls back to the
+// segmented upload service. Both honor the same marker contract.
+func (c *Connector) uploadBytes(
+	ctx context.Context,
+	body connector.SegmentSource,
+	filename string,
+	prior *store.UploadMarker,
+	jobID, srcPath string,
+	meta map[string]any,
+) (string, *store.UploadMarker, error) {
+	if c.directUpload && c.blob != nil {
+		return c.uploadDirect(ctx, body, filename, prior, jobID, srcPath, meta)
+	}
+	return c.upload(ctx, body, filename, prior, jobID, srcPath, meta)
+}
+
+// uploadDirect mints a SAS via the Aprimo API (one rate-limited call),
+// streams the bytes straight to blob storage out-of-band, and returns the
+// upload token. It honors the same marker states as the segmented path:
+// uploading → committed(token) → (the caller advances to) created. A
+// crash mid-upload is not block-resumable, so resume re-mints and
+// re-streams from scratch; the marker's real value is the committed→created
+// idempotency in Write, which keeps a retry from creating a duplicate
+// record once the token is in hand.
+func (c *Connector) uploadDirect(
+	ctx context.Context,
+	body connector.SegmentSource,
+	filename string,
+	prior *store.UploadMarker,
+	jobID, srcPath string,
+	meta map[string]any,
+) (string, *store.UploadMarker, error) {
+	du, err := c.api.Uploader.CreateDirectUpload(ctx, filename)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Defense in depth: the SAS URL decides where the file's bytes go.
+	// Only ever stream them to an Azure Blob endpoint; if the upload
+	// response points anywhere else (a tampered/MITM'd response, a
+	// misconfiguration), fall back to the segmented upload through Aprimo's
+	// own API rather than send customer bytes to an unexpected host.
+	if !isAzureBlobURL(du.SASURL) {
+		slog.Warn("aprimo: direct-upload SAS is not an Azure blob URL; using segmented upload instead",
+			"connector", c.name)
+		return c.upload(ctx, body, filename, prior, jobID, srcPath, meta)
+	}
+
+	// Stage the marker in "uploading" for crash visibility, mirroring the
+	// segmented path's setup (minus the segment bookkeeping, which doesn't
+	// apply to a single streamed blob).
+	var current *store.UploadMarker
+	if c.store != nil && jobID != "" {
+		if prior != nil {
+			cp := *prior
+			current = &cp
+			current.State = store.MarkerUploading
+		} else {
+			current = &store.UploadMarker{
+				JobID:           jobID,
+				Channel:         stringFromMeta(meta, "_channel"),
+				SourceConnector: stringFromMeta(meta, "_source_connector"),
+				SourcePath:      srcPath,
+				SourceVersion:   stringFromMeta(meta, "_source_version"),
+				Filename:        filename,
+				State:           store.MarkerUploading,
+			}
+		}
+		current.UploadPath = ""
+		current.SegmentsDone = nil
+		if err := c.store.SaveMarker(current); err != nil {
+			return "", current, fmt.Errorf("save uploading marker: %w", err)
+		}
+	}
+
+	if err := c.blob.Upload(ctx, du.SASURL, body, filename); err != nil {
+		return "", current, fmt.Errorf("direct blob upload: %w", err)
+	}
+
+	// Blob exists now, so the token is usable; record it for committed→
+	// created resume.
+	if current != nil {
+		current.State = store.MarkerCommitted
+		current.UploadToken = du.Token
+		if err := c.store.SaveMarker(current); err != nil {
+			return "", current, fmt.Errorf("save committed marker: %w", err)
+		}
+	}
+	return du.Token, current, nil
 }
 
 // upload runs the segmented upload, persisting progress to the marker
@@ -435,7 +584,7 @@ func (c *Connector) createRecord(
 	meta map[string]any,
 ) (string, error) {
 	req := aprimo.CreateRequest{
-		Status: c.cfg.DefaultStatus,
+		Status: statusFromMeta(meta, c.cfg.DefaultStatus),
 		Files:  aprimo.NewFilesFromUpload(uploadToken, filename),
 	}
 	fields, err := c.fieldsFromMeta(meta)
@@ -485,6 +634,9 @@ func (c *Connector) updateRecord(
 		return fmt.Errorf("aprimo[%s]: update record %s: %w", c.name, recordID, err)
 	}
 	req := aprimo.UpdateRequest{Files: files}
+	if s := statusFromMeta(meta, ""); s != "" {
+		req.Status = s
+	}
 	fields, err := c.fieldsFromMeta(meta)
 	if err != nil {
 		return err
@@ -546,14 +698,62 @@ func (c *Connector) WriteMetadata(ctx context.Context, recordID string, meta map
 	if err != nil {
 		return err
 	}
-	if len(fields) == 0 {
+	status := statusFromMeta(meta, "")
+	// Nothing to write: no resolved fields and no status change. The
+	// script (or import line) signalled a no-op.
+	if len(fields) == 0 && status == "" {
 		return nil
 	}
-	req := aprimo.UpdateRequest{Fields: fields}
+	req := aprimo.UpdateRequest{}
+	if len(fields) > 0 {
+		req.Fields = fields
+	}
+	if status != "" {
+		req.Status = status
+	}
 	if err := c.api.Records.Update(ctx, recordID, req, false); err != nil {
 		return fmt.Errorf("aprimo[%s]: update record metadata %s: %w", c.name, recordID, err)
 	}
 	return nil
+}
+
+// ValidateFields runs the same field-name/value resolution that Write
+// and WriteMetadata perform, returning the first error WITHOUT making
+// any API call. The import command's dry-run uses it to validate a
+// record's metadata against the live (prefetched) Aprimo catalog —
+// catching unknown field names, bad classification paths, missing
+// languages, and per-type value mismatches before anything is written.
+func (c *Connector) ValidateFields(meta map[string]any) error {
+	_, err := c.fieldsFromMeta(meta)
+	return err
+}
+
+// RateLimit reports the sustained request rate (RPS) and in-flight
+// request cap configured on this connector. A bulk-import driver anchors
+// its adaptive worker pool to these so it pushes the Aprimo client's
+// limiter exactly as hard as the tenant allows — no harder. maxConcurrent
+// is 0 when uncapped.
+func (c *Connector) RateLimit() (rps float64, maxConcurrent int) {
+	return c.cfg.RPS, c.cfg.MaxConcurrent
+}
+
+// SetRateObserver attaches a rate-limiter telemetry sink to the
+// underlying Aprimo client so the import scheduler can watch how close
+// it is running to the configured RPS. The daemon never calls this.
+func (c *Connector) SetRateObserver(obs aprimo.RateObserver) {
+	c.api.SetRateObserver(obs)
+}
+
+// statusFromMeta returns the per-record status override carried in
+// meta["dest_status"] (set by the import command), falling back to the
+// supplied default when absent or empty.
+func statusFromMeta(meta map[string]any, fallback string) string {
+	if meta != nil {
+		if s, ok := meta["dest_status"].(string); ok && s != "" {
+			return s
+		}
+	}
+	return fallback
 }
 
 // Delete permanently removes a record.
