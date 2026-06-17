@@ -82,8 +82,16 @@ func TestAdaptivePoolProcessesAllJobs(t *testing.T) {
 		t.Fatalf("DispatchBatch: %v", err)
 	}
 
+	// Wait until the store has fully settled, not just until the writes
+	// land: a job is marked done after its write, so draining pending+running
+	// to zero means every job reached a terminal state.
 	ok := runUntil(t, e, 5*time.Second, func() bool {
-		return len(dst.Writes()) >= n
+		if len(dst.Writes()) < n {
+			return false
+		}
+		pending, _ := st.ListJobs(ctx, store.StatusPending)
+		running, _ := st.ListJobs(ctx, store.StatusRunning)
+		return len(pending)+len(running) == 0
 	})
 	if !ok {
 		t.Fatalf("timed out: only %d of %d jobs processed", len(dst.Writes()), n)
