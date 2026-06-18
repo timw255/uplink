@@ -152,7 +152,11 @@ type Summary struct {
 	Invalid   int // dry-run
 	Rewritten int // dry-run: files whose name Aprimo will rewrite
 	Failed    int
-	Elapsed   time.Duration
+	// Aborted is the count of records left unprocessed because the run was
+	// stopped early (--stop-on-error tripped, or an interrupt). These are
+	// not failures — they were never attempted, and a resume retries them.
+	Aborted int
+	Elapsed time.Duration
 }
 
 func (s *Summary) add(r Result) {
@@ -281,6 +285,13 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 	go func() {
 		defer close(drainDone)
 		for r := range results {
+			// Once the run is winding down (--stop-on-error tripped, or an
+			// interrupt), the in-flight records fail with "context canceled".
+			// That's an abort, not a failure — don't write, count, or log it.
+			// Left un-done in the ledger, a resume picks them back up.
+			if r.Action == "error" && runCtx.Err() != nil {
+				continue
+			}
 			if werr := ledger.write(r); werr != nil {
 				im.logger.Warn("ledger write failed", "line", r.Line, "err", werr)
 			}
@@ -333,6 +344,11 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 	close(reportStop)
 	<-reportDone
 
+	// Records that parsed but never produced a result were abandoned when
+	// the run stopped early — report them as aborted, not failed.
+	if n := total - summary.Total; n > 0 {
+		summary.Aborted = n
+	}
 	summary.Elapsed = time.Since(start)
 	return summary, nil
 }

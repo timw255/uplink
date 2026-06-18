@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,6 +51,13 @@ type fakeDest struct {
 	// panicPath: UploadOnly panics for this source path, simulating a
 	// record-triggered bug deep in the SDK/connector.
 	panicPath string
+	// failCreatePath: CreateFromToken returns a hard error for this path
+	// (used to trip --stop-on-error in tests).
+	failCreatePath string
+	// blockCreateUntilCancel: CreateFromToken for any other path blocks
+	// until ctx is canceled, then returns ctx.Err() — simulating the
+	// in-flight records that get aborted when the run stops.
+	blockCreateUntilCancel bool
 }
 
 func (d *fakeDest) UploadOnly(_ context.Context, srcPath string, _ connector.SegmentSource, meta map[string]any) (string, error) {
@@ -65,7 +73,15 @@ func (d *fakeDest) UploadOnly(_ context.Context, srcPath string, _ connector.Seg
 	return "tok-" + srcPath, nil
 }
 
-func (d *fakeDest) CreateFromToken(_ context.Context, srcPath, token string, meta map[string]any) (connector.Entry, error) {
+func (d *fakeDest) CreateFromToken(ctx context.Context, srcPath, token string, meta map[string]any) (connector.Entry, error) {
+	// Checked without the lock so a blocking create can't stall the others.
+	if d.failCreatePath != "" && srcPath == d.failCreatePath {
+		return connector.Entry{}, errors.New("synthetic create failure")
+	}
+	if d.blockCreateUntilCancel {
+		<-ctx.Done()
+		return connector.Entry{}, ctx.Err()
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.createErr != nil {

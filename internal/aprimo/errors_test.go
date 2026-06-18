@@ -1,8 +1,10 @@
 package aprimo
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -11,6 +13,21 @@ import (
 // upload. Captured from a live trial environment via the diagnostic
 // probe; see project memory `project_upload_token_purge` for context.
 const noDataFoundBodyTemplate = `{"exceptionType":"Adam.Rest.Common.NoDataFoundException","exceptionMessage":"Cannot find the uploaded file specified with the token 'tok-xyz'.","stackTrace":null,"innerException":null}`
+
+// TestError_SurfacesCause: a transport-class error (no HTTP status) must
+// include its underlying cause in the message, so a bare "rate limiter
+// wait" doesn't hide the real "context canceled".
+func TestError_SurfacesCause(t *testing.T) {
+	err := newTransportError("rate limiter wait", context.Canceled)
+	got := err.Error()
+	if !strings.Contains(got, "rate limiter wait") || !strings.Contains(got, "context canceled") {
+		t.Fatalf("Error() = %q, want it to surface both the message and the cause", got)
+	}
+	// Cause-only (no message) still reports the cause, not "aprimo: error".
+	if g := (&Error{Cause: context.Canceled}).Error(); !strings.Contains(g, "context canceled") {
+		t.Fatalf("cause-only Error() = %q, want the cause surfaced", g)
+	}
+}
 
 func TestErrorIs_UploadTokenMissing_PositiveCase(t *testing.T) {
 	err := newHTTPError(

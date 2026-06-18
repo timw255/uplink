@@ -40,8 +40,15 @@ func (e *Error) Error() string {
 		return fmt.Sprintf("aprimo: %d %s: %s", e.Status, http.StatusText(e.Status), e.Message)
 	case e.Status != 0:
 		return fmt.Sprintf("aprimo: %d %s", e.Status, http.StatusText(e.Status))
+	case e.Message != "" && e.Cause != nil:
+		// Transport-class failures (no HTTP status) carry their real reason
+		// in Cause — surface it so e.g. "rate limiter wait" shows the
+		// underlying "context canceled" instead of masking it.
+		return fmt.Sprintf("aprimo: %s: %v", e.Message, e.Cause)
 	case e.Message != "":
 		return "aprimo: " + e.Message
+	case e.Cause != nil:
+		return fmt.Sprintf("aprimo: %v", e.Cause)
 	default:
 		return "aprimo: error"
 	}

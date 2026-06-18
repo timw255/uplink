@@ -184,6 +184,9 @@ func runImport(args []string, stdout io.Writer) error {
 	if *dryRun && sum.Invalid > 0 {
 		return fmt.Errorf("%d of %d record(s) failed validation", sum.Invalid, sum.Total)
 	}
+	if !*dryRun && sum.Aborted > 0 {
+		return fmt.Errorf("run stopped early: %d failed, %d not processed (rerun to resume)", sum.Failed, sum.Aborted)
+	}
 	if !*dryRun && sum.Failed > 0 {
 		return fmt.Errorf("%d of %d record(s) failed to import", sum.Failed, sum.Total)
 	}
@@ -206,7 +209,11 @@ func printImportSummary(w io.Writer, s importer.Summary, dryRun bool) {
 		}
 		return
 	}
-	fmt.Fprintf(w, "Import complete in %s\n", s.Elapsed.Round(time.Millisecond))
+	headline := "Import complete in"
+	if s.Aborted > 0 {
+		headline = "Import stopped after"
+	}
+	fmt.Fprintf(w, "%s %s\n", headline, s.Elapsed.Round(time.Millisecond))
 	fmt.Fprintf(w, "  records:  %d\n", s.Total)
 	fmt.Fprintf(w, "  created:  %d\n", s.Created)
 	fmt.Fprintf(w, "  updated:  %d\n", s.Updated)
@@ -215,6 +222,9 @@ func printImportSummary(w io.Writer, s importer.Summary, dryRun bool) {
 		fmt.Fprintf(w, "  skipped:  %d\n", s.Skipped)
 	}
 	fmt.Fprintf(w, "  failed:   %d\n", s.Failed)
+	if s.Aborted > 0 {
+		fmt.Fprintf(w, "  not processed: %d (run stopped early — rerun to resume)\n", s.Aborted)
+	}
 }
 
 // resolveLedger decides where per-record outcomes are tracked and

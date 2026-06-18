@@ -50,6 +50,39 @@ func TestPipelineClampsDegenerateConcurrency(t *testing.T) {
 	}
 }
 
+// TestAbortReportsInflightAsNotProcessed: when --stop-on-error trips on a
+// real failure, the in-flight records that then die with context.Canceled
+// must be reported as "aborted" (not processed), NOT counted or logged as
+// failures. One bad record can't masquerade as thousands.
+func TestAbortReportsInflightAsNotProcessed(t *testing.T) {
+	const n = 6
+	lines := make([]string, n)
+	files := map[string]int64{}
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("f-%02d.bin", i)
+		lines[i] = fmt.Sprintf(`{"file":%q,"fields":[{"name":"T","value":"x"}]}`, name)
+		files[name] = 10
+	}
+	manifest := writeManifest(t, lines...)
+	dest := &fakeDest{failCreatePath: "f-03.bin", blockCreateUntilCancel: true}
+	src := &fakeSource{files: files}
+
+	sum := runImporter(t, Options{
+		ManifestPath: manifest, Dest: dest, Source: src, StopOnError: true,
+	})
+
+	if sum.Failed != 1 {
+		t.Fatalf("Failed = %d, want exactly 1 (the real error, not the cascade)", sum.Failed)
+	}
+	if sum.Aborted == 0 {
+		t.Fatalf("Aborted = 0, want the in-flight records reported as not-processed")
+	}
+	if got := sum.Failed + sum.Aborted + sum.Created; got != n {
+		t.Fatalf("accounting off: failed=%d aborted=%d created=%d sum=%d, want %d",
+			sum.Failed, sum.Aborted, sum.Created, got, n)
+	}
+}
+
 // seedLedger writes the given rows to a fresh ledger file for resume tests.
 func seedLedger(t *testing.T, rows ...Result) string {
 	t.Helper()
