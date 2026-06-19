@@ -20,6 +20,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 
 	"github.com/timw255/uplink/internal/connector"
 	"github.com/timw255/uplink/internal/ignore"
@@ -230,6 +231,21 @@ func (c *Connector) OpenRange(ctx context.Context, path string, start, length in
 		return nil, fmt.Errorf("azblob[%s]: get range %s [%d-%d]: %w", c.name, path, start, start+length-1, err)
 	}
 	return resp.Body, nil
+}
+
+// PresignGetURL mints a short-lived read SAS URL for one blob, so a
+// destination can have Azure copy the bytes server-side (StageBlockFromURL)
+// instead of routing them through this machine — an intra-Azure copy that
+// never touches our bandwidth. Works with shared-key and connection-string
+// auth; a SAS-token-only source can't re-sign, so it returns an error and
+// the destination falls back to streaming the bytes through.
+func (c *Connector) PresignGetURL(_ context.Context, path string, ttl time.Duration) (string, error) {
+	blobClient := c.client.ServiceClient().NewContainerClient(c.cfg.Container).NewBlobClient(c.fullKey(path))
+	url, err := blobClient.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(ttl), nil)
+	if err != nil {
+		return "", fmt.Errorf("azblob[%s]: presign %q: %w", c.name, path, err)
+	}
+	return url, nil
 }
 
 // Write / Delete / Move return ErrUnsupported. Azure Blob is a

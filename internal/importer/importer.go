@@ -119,8 +119,6 @@ type Options struct {
 	StatusWriter io.Writer
 	// StatusInterval overrides the status refresh cadence (tests).
 	StatusInterval time.Duration
-	// ControllerTick overrides the upload-concurrency sampling interval (tests).
-	ControllerTick time.Duration
 
 	Logger *slog.Logger
 }
@@ -334,7 +332,6 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 			logger:     im.logger,
 			uploadCap:  upload,
 			createConc: create,
-			tick:       im.opts.ControllerTick,
 		}
 		p.run(runCtx, passed, uploaded)
 	}

@@ -230,6 +230,23 @@ func (c *Connector) OpenRange(ctx context.Context, path string, start, length in
 	return out.Body, nil
 }
 
+// PresignGetURL signs a short-lived GET URL for one object, so a
+// destination can have storage fetch the bytes server-side
+// (StageBlockFromURL) instead of routing them through this machine. S3
+// presigned URLs leave the Range header unsigned, so the fetcher can ask
+// for the byte ranges it needs. With temporary (STS) credentials the URL is
+// only valid as long as the session — fine for static access keys.
+func (c *Connector) PresignGetURL(ctx context.Context, path string, ttl time.Duration) (string, error) {
+	req, err := awss3.NewPresignClient(c.client).PresignGetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(c.cfg.Bucket),
+		Key:    aws.String(c.fullKey(path)),
+	}, awss3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", fmt.Errorf("s3[%s]: presign %q: %w", c.name, path, err)
+	}
+	return req.URL, nil
+}
+
 // Write / Delete / Move return ErrUnsupported. S3 is a source-only
 // connector — channels flow storage → Aprimo, never the other way.
 func (c *Connector) Write(_ context.Context, _ string, _ connector.SegmentSource, _ map[string]any) (connector.Entry, error) {

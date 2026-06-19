@@ -15,19 +15,19 @@ import (
 func newTestResolver() *resolver {
 	return &resolver{
 		fieldsByName: map[string]fieldRef{
-			"caption":       {ID: "fld-caption", DataType: aprimo.DataTypeSingleLineText},
-			"rights holder": {ID: "fld-rights", DataType: aprimo.DataTypeSingleLineText},
-			"client":        {ID: "fld-client", DataType: aprimo.DataTypeSingleLineText},
-			"word count":    {ID: "fld-wc", DataType: aprimo.DataTypeNumeric},
-			"shot date":     {ID: "fld-date", DataType: aprimo.DataTypeDate},
-			"raw meta":      {ID: "fld-json", DataType: aprimo.DataTypeJSON},
-			"keywords":      {ID: "fld-kw", DataType: aprimo.DataTypeTextList},
-			"topics":        {ID: "fld-topics", DataType: aprimo.DataTypeClassificationList},
-			"department":    {ID: "fld-dept", DataType: aprimo.DataTypeOptionList},
-			"owner":         {ID: "fld-owner", DataType: aprimo.DataTypeUserList},
-			"review team":   {ID: "fld-rev", DataType: aprimo.DataTypeUserGroupList},
-			"related":       {ID: "fld-rel", DataType: aprimo.DataTypeRecordList},
-			"links":         {ID: "fld-links", DataType: aprimo.DataTypeHyperlinkList},
+			"caption":        {ID: "fld-caption", DataType: aprimo.DataTypeSingleLineText},
+			"rights holder":  {ID: "fld-rights", DataType: aprimo.DataTypeSingleLineText},
+			"client":         {ID: "fld-client", DataType: aprimo.DataTypeSingleLineText},
+			"word count":     {ID: "fld-wc", DataType: aprimo.DataTypeNumeric},
+			"shot date":      {ID: "fld-date", DataType: aprimo.DataTypeDate},
+			"raw meta":       {ID: "fld-json", DataType: aprimo.DataTypeJSON},
+			"keywords":       {ID: "fld-kw", DataType: aprimo.DataTypeTextList},
+			"topics":         {ID: "fld-topics", DataType: aprimo.DataTypeClassificationList},
+			"department":     {ID: "fld-dept", DataType: aprimo.DataTypeOptionList},
+			"owner":          {ID: "fld-owner", DataType: aprimo.DataTypeUserList},
+			"review team":    {ID: "fld-rev", DataType: aprimo.DataTypeUserGroupList},
+			"related":        {ID: "fld-rel", DataType: aprimo.DataTypeRecordList},
+			"links":          {ID: "fld-links", DataType: aprimo.DataTypeHyperlinkList},
 			"interface lang": {ID: "fld-ilang", DataType: aprimo.DataTypeLanguageList},
 		},
 		languagesByCulture: map[string]string{
@@ -42,8 +42,8 @@ func newTestResolver() *resolver {
 		},
 		defaultLanguageID: "lang-en",
 		classificationsByPath: map[string]string{
-			"topics":                "cls-topics",
-			"topics/sports":        "cls-sports",
+			"topics":                 "cls-topics",
+			"topics/sports":          "cls-sports",
 			"topics/sports/football": "cls-football",
 		},
 		optionItemsByField: map[string]map[string]string{

@@ -8,9 +8,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	"github.com/timw255/uplink/internal/adaptive"
 	"github.com/timw255/uplink/internal/aprimo"
 	"github.com/timw255/uplink/internal/connector"
 )
@@ -43,9 +41,8 @@ type pipeline struct {
 	stats   *liveStats
 	logger  *slog.Logger
 
-	uploadCap  int // ceiling the MB/s controller ramps the upload pool to
+	uploadCap  int // fixed pool of file feeders (byte concurrency lives in the connector)
 	createConc int // concurrent record writes (rate-limiter paced)
-	tick       time.Duration
 }
 
 // run drives both stages to completion. passed is the validated, stat'd
@@ -122,32 +119,27 @@ func (p *pipeline) startCreatePool(ctx context.Context, createWork <-chan create
 	return &wg
 }
 
-// startUploadPool launches the upload workers behind a resizable gate that
-// an MB/s controller ramps to saturate bandwidth. uploadCap goroutines
-// exist; the gate decides how many are live.
+// startUploadPool launches a fixed pool of file feeders. Each mints a slot
+// and streams one file at a time; the actual byte-plane concurrency — and
+// its adaptive budget — lives in the connector's blob uploader, one global
+// pool shared across every file's blocks. So this pool just keeps files
+// flowing: it's paced by the rate-limited mint and by backpressure from a
+// full create queue, not by a gate here.
 func (p *pipeline) startUploadPool(ctx context.Context, sched *scheduler, createWork chan<- createJob, queueDepth int) *sync.WaitGroup {
-	gate := adaptive.NewGate(min(p.uploadCap, 4), p.uploadCap)
-	gate.Watch(ctx)
-
-	ctrlCtx, stopController := context.WithCancel(ctx)
-	go p.runController(ctrlCtx, gate)
-
 	var wg sync.WaitGroup
 	for i := 0; i < p.uploadCap; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
-				if err := gate.Acquire(ctx); err != nil {
-					return // ctx cancelled
+				if ctx.Err() != nil {
+					return // run aborting
 				}
 				wr, ok := sched.next(len(createWork), queueDepth)
 				if !ok {
-					gate.Release()
 					return
 				}
 				job, err := p.safeUpload(ctx, wr)
-				gate.Release()
 				if err != nil {
 					p.results <- fail(wr.result(), err)
 					continue
@@ -164,9 +156,6 @@ func (p *pipeline) startUploadPool(ctx context.Context, sched *scheduler, create
 			}
 		}()
 	}
-
-	// Stop tuning the moment uploads are done.
-	go func() { wg.Wait(); stopController() }()
 	return &wg
 }
 
@@ -186,26 +175,6 @@ func (p *pipeline) startDirectFeed(ctx context.Context, createWork chan<- create
 		}
 	}()
 	return done
-}
-
-// runController ramps the upload gate to saturate bandwidth. It keys on
-// measured upload MB/s with no target ceiling (TargetRPS 0): the control
-// law adds concurrency while throughput climbs and holds once it plateaus
-// — the pipe is the only thing that can stop it.
-func (p *pipeline) runController(ctx context.Context, g *adaptive.Gate) {
-	ctrl := &adaptive.Controller{TargetRPS: 0, MaxLimit: p.uploadCap, Baseline: 1}
-	var lastBytes int64
-	lastT := time.Now()
-	ctrl.Run(ctx, g, p.tick, func() adaptive.Sample {
-		now := time.Now()
-		b := p.stats.bytesUploaded.Load()
-		var mbps float64
-		if dt := now.Sub(lastT).Seconds(); dt > 0 {
-			mbps = float64(b-lastBytes) / dt / (1 << 20)
-		}
-		lastBytes, lastT = b, now
-		return adaptive.Sample{Achieved: mbps, HasBacklog: true}
-	})
 }
 
 // upload streams one file's bytes to blob storage and returns the create

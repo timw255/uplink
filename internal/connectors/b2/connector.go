@@ -164,6 +164,19 @@ func (c *Connector) OpenRange(ctx context.Context, path string, start, length in
 	return r, nil
 }
 
+// PresignGetURL returns a short-lived authenticated download URL for one
+// object (a B2 download-authorization token embedded in the URL), so a
+// destination can have storage fetch the bytes server-side
+// (StageBlockFromURL) instead of routing them through this machine. B2
+// downloads honor the Range header, so the fetcher can pull byte ranges.
+func (c *Connector) PresignGetURL(ctx context.Context, path string, ttl time.Duration) (string, error) {
+	u, err := c.bucket.Object(c.fullKey(path)).AuthURL(ctx, ttl, "")
+	if err != nil {
+		return "", fmt.Errorf("b2[%s]: presign %q: %w", c.name, path, err)
+	}
+	return u.String(), nil
+}
+
 // Write / Delete / Move return ErrUnsupported. B2 is a source-only
 // connector — channels flow storage → Aprimo, never the other way.
 func (c *Connector) Write(_ context.Context, _ string, _ connector.SegmentSource, _ map[string]any) (connector.Entry, error) {

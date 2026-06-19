@@ -134,6 +134,7 @@ Watches a directory on the host filesystem. Detects creates, updates (via mtime 
   config:
     root: "./incoming"        # directory to watch (relative or absolute)
     poll_interval: "2s"
+    sequential_reads: false   # set true for spinning-disk / NAS roots (see Bulk import)
 ```
 
 No credentials. The connector treats the configured `root` as its sandbox — it never reads outside it, even if a metadata-driven path tries to traverse with `..`.
@@ -261,23 +262,24 @@ The Aprimo DAM. Always the destination; never used as a source.
                                     # + socket-pool safety net independent of `rps`.
                                     # 0 (default) = uncapped.
     http_timeout: "60s"             # SDK request timeout
-    direct_upload: true             # upload file bytes straight to Aprimo's
-                                    # Azure Blob storage via a SAS URL, off the
-                                    # rate-limited API. Default true; see below.
+    direct_upload: true             # upload file bytes straight to storage,
+                                    # off the rate-limited API. Default true;
+                                    # see below.
+    direct_upload_concurrency: 0    # cap upload parallelism; 0 (default) =
+                                    # auto-tune. Lower it to limit memory.
 ```
 
 Authenticates via the `client_credentials` OAuth flow.
 
 #### Direct-to-blob uploads
 
-Aprimo's storage is Azure Blob, and its upload API can hand back a short-lived, writable **SAS URL** pointing straight at the backing blob. With `direct_upload: true` (the default), Uplink uploads file bytes **directly to that blob URL** — using the same block-parallel protocol AzCopy uses, via the Azure SDK already in the binary (no external tools) — instead of streaming them through Aprimo's HTTP upload service.
+With `direct_upload: true` (the default), file bytes go **straight to Aprimo's backing blob storage** instead of through Aprimo's rate-limited upload API. So a large upload barely touches your `rps` budget — that budget goes to writing the record, not moving the bytes — and upload speed is bounded by your network, not Aprimo's API.
 
-Two things make this a big win for upload-heavy work:
+When the source is a cloud object store with credentials — **S3, Azure Blob, or B2** — Uplink goes further and has Azure pull the bytes **directly from the source**, so they never pass through the machine running Uplink at all. An Azure-to-Azure migration becomes an intra-cloud copy at line rate. (Azure Blob sources need shared-key or connection-string credentials for this; otherwise the bytes stream through Uplink as usual.)
 
-- **It bypasses the rate limiter.** The bytes never hit the Aprimo API, so a large file costs **one** request against your `rps` budget (to mint the SAS) plus the record write — not dozens of segment POSTs. Your whole RPS budget is freed for metadata, and the adaptive worker pool fills your bandwidth instead of pacing against the token bucket.
-- **Azure ingests at full line rate.** Throughput is bounded by your pipe, not Aprimo's proxy.
+If a **localfs** source lives on a spinning hard disk or a NAS, set `sequential_reads: true` on that connector. Parallel reads thrash the heads and tank throughput on spinning media, so Uplink reads one file at a time instead. Leave it off for SSD/NVMe (the default).
 
-Set `direct_upload: false` to route uploads through Aprimo's segmented upload service instead — a kill-switch for tenants where the direct path misbehaves. Either way, an interrupted upload re-streams the file on the next attempt and the record is created exactly once — see [If the daemon crashes mid-sync](#if-the-daemon-crashes-mid-sync).
+Upload concurrency tunes itself — ramping up to fill a fast pipe, easing off when idle. The one lever is `direct_upload_concurrency` on the Aprimo connector, which caps it; lower it only to limit memory on a tight machine (peak upload memory is roughly that number × 16 MB). `direct_upload: false` is the kill-switch — it routes uploads back through Aprimo's own upload service for tenants where the direct path misbehaves. Either way, an interrupted upload retries cleanly and the record is created exactly once.
 
 At startup (and again on every `refresh_interval` tick) the connector prefetches the tenant's field-definition, language, classification, option-item, user, and user-group catalogs so companion scripts can reference everything by display name without ever touching opaque GUIDs. New fields added in Aprimo become visible at the next refresh; renamed fields likewise. If `refresh_interval: 0s`, restart the daemon to pick up changes.
 
@@ -769,26 +771,23 @@ uplink import --file=records.jsonl --source=fs-in --destination=aprimo-prod
 
 ### The ledger (resume and dedup)
 
-So every import keeps a ledger: one JSONL row per processed record (`{line, hash, action, dest_id, error?}`). By default it lives at:
+Every real import keeps a small ledger under the data dir, keyed to the (manifest, destination) pair:
 
 ```
 <data_dir>/imports/<manifest>-<hash>.jsonl
 ```
 
-keyed to the (manifest, destination) pair, so re-running the same import against the same Aprimo environment finds the same ledger. On a re-run, any record already recorded as `created`, `updated`, or `metadata` is **skipped** — that's the dedup that stops a crashed or re-issued import from uploading the same file multiple times. Failed and invalid lines are *not* marked done, so they're retried on the next run.
+It tracks what's finished, so **re-running resumes where it left off**: records already created, updated, or stamped are skipped, and a file that finished uploading won't upload again — even if the run was killed before that record was written. You never redo the slow part, and the same file is never uploaded twice. (If an upload sat half-finished long enough for Aprimo to clean it up, that one file simply re-uploads.)
 
-The ledger also records an intermediate `uploaded` state: the moment a file's bytes are in blob storage (with its token) but before the record is created. So if a crash lands in that window — the expensive part already done — **resume skips the re-upload and creates straight from the saved token.** If Aprimo has since swept the upload (it cleans unattached uploads up after a few days), the create simply fails with "upload token missing" and the pipeline re-uploads that one file and retries.
-
-You normally don't touch any of this — just re-run the command and it picks up where it left off. `--restart` is the one knob: it ignores prior progress and re-processes every record from scratch.
-
-A dry run keeps no ledger — it's pure validation with nothing worth persisting.
+Failed and invalid lines aren't marked done, so they retry on the next run. You normally don't touch any of this — just re-run the command and it picks up where it left off. `--restart` is the one knob: it ignores all prior progress and re-processes every line from scratch. A dry run keeps no ledger.
 
 ### Speed
 
-A bulk import pushes against two limits at once: the **Aprimo API** (gated by your licensed `rps`) and your **bandwidth** (carrying the file bytes). The importer saturates both by running uploads and record-writes as decoupled stages with a queue between them — bytes stream straight to Azure blob storage [off the rate limiter](#direct-to-blob-uploads) while records get written at the `rps` pace. A slow multi-gigabyte upload runs in the background and never starves record creation, so you hit the API ceiling instead of stalling behind a transfer.
+A bulk import is held back by two limits at once: Aprimo's API rate (your licensed `rps`) and your network bandwidth (moving the file bytes). Uplink works **both at the same time** — bytes upload straight to storage [off the rate limiter](#direct-to-blob-uploads) while records write at full `rps` — so a slow multi-gigabyte upload never stalls record creation. You don't set any of this; it scales itself to your machine and your pipe.
 
-You normally set none of these: the upload stage auto-scales to fill your bandwidth and the create stage is paced by `rps`, so the system finds the right concurrency on its own. Reach for these only to **override the auto-tuning** — when you need a hard cap because the host is tight on memory or sockets, or you just want fixed, predictable concurrency instead of a pool that grows and shrinks:
+To rein it in on a constrained machine, the levers are:
 
-- `--upload-concurrency=N` (default 32) — caps how many files upload at once. The auto-tuner never ramps past this; set it low to protect a constrained host, high to push a fat pipe harder. `--max-workers` is an alias.
-- `--create-concurrency=N` (default 16) — caps concurrent record writes. The `rps` limiter already paces these, so this only matters if you want to hold record-writing below your licensed rate.
+- `direct_upload_concurrency` (on the Aprimo connector) — the memory cap on the upload side; see [direct-to-blob](#direct-to-blob-uploads).
+- `--create-concurrency=N` (default 16) — concurrent record writes. The `rps` limiter already paces these, so lower it only to hold writes below your licensed rate.
+- `--upload-concurrency=N` — how many files are in flight at once (`--max-workers` is an alias).
 

@@ -40,6 +40,13 @@ type Config struct {
 	// upload service (a kill-switch if a tenant's direct path misbehaves).
 	DirectUpload bool
 
+	// DirectUploadConcurrency caps the direct path's block-staging budget.
+	// By default uplink ramps the live budget toward this on its own to
+	// fill the pipe; this value is just the ceiling (peak upload memory ≈
+	// this × the 16 MiB block size). Lower it only when the full ramp is
+	// too aggressive for the machine uplink runs on. 0 → a default ceiling.
+	DirectUploadConcurrency int
+
 	// DefaultLanguage is the IETF culture tag (e.g., "en-US") used for
 	// companion-script-produced field values that don't specify a
 	// language. Validated at connector Init against the tenant's
@@ -82,10 +89,11 @@ type Config struct {
 // environment.
 func loadConfig(name string, raw map[string]any) (*Config, error) {
 	cfg := &Config{
-		DefaultStatus:   "draft",
-		HTTPTimeout:     60 * time.Second,
-		RefreshInterval: 1 * time.Hour,
-		DirectUpload:    true,
+		DefaultStatus:           "draft",
+		HTTPTimeout:             60 * time.Second,
+		RefreshInterval:         1 * time.Hour,
+		DirectUpload:            true,
+		DirectUploadConcurrency: defaultBlockCeiling,
 	}
 
 	if v, ok := raw["environment"].(string); ok {
@@ -111,6 +119,9 @@ func loadConfig(name string, raw map[string]any) (*Config, error) {
 	}
 	if v, ok := raw["direct_upload"].(bool); ok {
 		cfg.DirectUpload = v
+	}
+	if v, ok := raw["direct_upload_concurrency"].(int); ok && v > 0 {
+		cfg.DirectUploadConcurrency = v
 	}
 	if v, ok := raw["http_timeout"].(string); ok {
 		d, err := connector.ParseDuration(v)

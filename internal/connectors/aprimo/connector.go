@@ -85,7 +85,7 @@ func Factory(name string, raw map[string]any) (connector.Connector, error) {
 		name:         name,
 		cfg:          cfg,
 		api:          api,
-		blob:         newAzureBlobUploader(),
+		blob:         newBlockUploader(cfg.DirectUploadConcurrency, directBlockSize),
 		directUpload: cfg.DirectUpload,
 	}, nil
 }

@@ -28,9 +28,15 @@ type Connector struct {
 
 // Config is the YAML connector block for localfs.
 type Config struct {
-	Root         string                 `yaml:"root"`
-	PollInterval time.Duration          `yaml:"poll_interval"`
+	Root         string                  `yaml:"root"`
+	PollInterval time.Duration           `yaml:"poll_interval"`
 	Watchers     []connector.WatcherSpec `yaml:"watchers"`
+	// Sequential makes the importer read one file at a time, front-to-back,
+	// instead of issuing parallel ranged reads. Set it when the root lives
+	// on spinning media — a local HDD or a NAS/storage server — where
+	// concurrent seeks tank throughput. Default false (parallel), the right
+	// choice for SSD/NVMe. Only affects bulk upload reads.
+	Sequential bool `yaml:"sequential_reads"`
 }
 
 const defaultPollInterval = 2 * time.Second
@@ -64,6 +70,9 @@ func Factory(name string, raw map[string]any) (connector.Connector, error) {
 		}
 		cfg.PollInterval = d
 	}
+	if v, ok := raw["sequential_reads"].(bool); ok {
+		cfg.Sequential = v
+	}
 	watchers, err := connector.ParseWatchersYAML("localfs", name, raw["watchers"])
 	if err != nil {
 		return nil, err
@@ -71,6 +80,10 @@ func Factory(name string, raw map[string]any) (connector.Connector, error) {
 	cfg.Watchers = watchers
 	return New(name, cfg)
 }
+
+// SequentialReads reports whether reads should be serialized front-to-back
+// (spinning media). Consumed by the bulk uploader via the SegmentSource.
+func (c *Connector) SequentialReads() bool { return c.cfg.Sequential }
 
 // Name implements connector.Connector.
 func (c *Connector) Name() string { return c.name }

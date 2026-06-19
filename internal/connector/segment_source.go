@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // SegmentSource is the read side of streaming-through uploads. A
@@ -38,6 +39,29 @@ func SegmentSourceFor(src Connector, entry Entry) SegmentSource {
 		conn:  src,
 		entry: entry,
 	}
+}
+
+// SequentialReads reports whether the underlying source prefers sequential,
+// one-at-a-time reads (spinning media). Sources opt in by implementing the
+// same method; the rest read in parallel.
+func (s *connectorSource) SequentialReads() bool {
+	if seq, ok := s.conn.(interface{ SequentialReads() bool }); ok {
+		return seq.SequentialReads()
+	}
+	return false
+}
+
+// PresignGetURL returns a short-lived authenticated GET URL for this entry,
+// so a destination can have storage fetch the bytes server-side. Sources
+// with credentials (object stores) implement it; others return an error and
+// the destination falls back to streaming the bytes through.
+func (s *connectorSource) PresignGetURL(ctx context.Context, ttl time.Duration) (string, error) {
+	if p, ok := s.conn.(interface {
+		PresignGetURL(context.Context, string, time.Duration) (string, error)
+	}); ok {
+		return p.PresignGetURL(ctx, s.entry.Path, ttl)
+	}
+	return "", errors.New("source does not support presigned URLs")
 }
 
 type connectorSource struct {
