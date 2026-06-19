@@ -4,11 +4,49 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+// TestCollectionsAddRecords_Chunks verifies AddRecords files a large set in
+// UpdateRecords calls of at most collectionFileBatchSize, sending every id
+// exactly once as an AddOrUpdate action.
+func TestCollectionsAddRecords_Chunks(t *testing.T) {
+	var calls, totalIDs int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+		}
+		var req UpdateCollectionRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		calls++
+		if req.Records != nil {
+			totalIDs += len(req.Records.AddOrUpdate)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cs := &Collections{r: &requester{client: srv.Client(), auth: stubAuth("tok"), baseURL: srv.URL}}
+
+	ids := make([]string, 1500) // 1000 + 500 → two chunks
+	for i := range ids {
+		ids[i] = fmt.Sprintf("rec-%d", i)
+	}
+	if err := cs.AddRecords(context.Background(), "coll-1", ids); err != nil {
+		t.Fatalf("AddRecords: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("PUT calls = %d, want 2 (chunked at %d)", calls, CollectionBatchSize)
+	}
+	if totalIDs != 1500 {
+		t.Fatalf("total filed ids = %d, want 1500", totalIDs)
+	}
+}
 
 // TestCollectionsUpdateRecords verifies the request shape Collections.UpdateRecords
 // sends: PUT against /api/core/collection/{id} with the records action set

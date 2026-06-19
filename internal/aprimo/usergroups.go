@@ -31,7 +31,7 @@ const maxUserGroups = 10_000
 
 // List walks every page of /api/core/usergroups.
 func (g *UserGroups) List(ctx context.Context) ([]UserGroup, error) {
-	headers := map[string]string{"pageSize": strconv.Itoa(200)}
+	headers := map[string]string{"pageSize": strconv.Itoa(listPageSize)}
 
 	path := "/api/core/usergroups"
 	var out []UserGroup

@@ -43,6 +43,17 @@ type pipeline struct {
 
 	uploadCap  int // fixed pool of file feeders (byte concurrency lives in the connector)
 	createConc int // concurrent record writes (rate-limiter paced)
+
+	// masterFiles maps an update record's id to its master file id, resolved
+	// in batched search calls before the run so the create stage skips the
+	// per-record MasterFile GET. Empty for records the batch didn't cover —
+	// the connector falls back to the per-record lookup.
+	masterFiles map[string]string
+
+	// deferCollection tells the create stage to suppress the connector's
+	// per-record collection filing (via the defer_collection_add meta flag);
+	// the importer files all created records in batches after the run.
+	deferCollection bool
 }
 
 // run drives both stages to completion. passed is the validated, stat'd
@@ -201,6 +212,12 @@ func (p *pipeline) upload(ctx context.Context, wr workRecord) (createJob, error)
 func (p *pipeline) create(ctx context.Context, cj createJob) Result {
 	res := cj.wr.result()
 	meta := cj.wr.rec.meta()
+	if mf := p.masterFiles[cj.wr.rec.ID]; mf != "" {
+		meta["dest_master_file_id"] = mf // skip the per-record MasterFile GET
+	}
+	if p.deferCollection {
+		meta["defer_collection_add"] = true // importer batch-files after the run
+	}
 	if cj.wr.rec.File == "" {
 		if err := p.dest.WriteMetadata(ctx, cj.wr.rec.ID, meta); err != nil {
 			return fail(res, err)

@@ -74,33 +74,42 @@ func (l *ledger) close() error {
 	return cerr
 }
 
-// loadLedgerState reads an existing ledger and returns two maps for
-// resume:
-//
-//   - done: hashes that completed (created/updated/metadata) — skipped
-//     entirely on resume.
-//   - uploaded: hash → token for records whose bytes were uploaded but
-//     whose record was never created (a crash between the two stages).
-//     Resume skips the upload and creates straight from the saved token;
-//     if Aprimo has since swept the blob, the create fails with
-//     ErrUploadTokenMissing and the pipeline just re-uploads — no
-//     timestamp guard needed.
-//
-// A "done" hash is removed from uploaded (the record finished). Failed/
-// invalid/skipped lines are excluded so resume re-attempts them. A
-// missing file is not an error — nothing is done yet.
-func loadLedgerState(path string) (done map[string]bool, uploaded map[string]string, err error) {
-	done = map[string]bool{}
-	uploaded = map[string]string{}
+// resumeState is what a prior ledger tells a resuming run.
+type resumeState struct {
+	// done: hashes that completed (created/updated/metadata) — skipped
+	// entirely on resume.
+	done map[string]bool
+	// uploaded: hash → token for records whose bytes were uploaded but
+	// whose record was never created (a crash between the two stages).
+	// Resume skips the upload and creates straight from the saved token;
+	// if Aprimo has since swept the blob, the create fails with
+	// ErrUploadTokenMissing and the pipeline just re-uploads.
+	uploaded map[string]string
+	// unfiled: record ids that were created but have no "filed" marker —
+	// a crash (or interrupt) before the collection-filing phase finished.
+	// Resume re-files them (idempotent). Collection membership can't be
+	// read back from a record, and the collection is too large to
+	// enumerate, so this ledger is the only record of what's been filed.
+	unfiled []string
+}
+
+// loadLedgerState reads an existing ledger into a resumeState. A "done"
+// hash is removed from uploaded (the record finished). Failed/invalid/
+// skipped lines are excluded so resume re-attempts them. A missing file is
+// not an error — nothing is done yet.
+func loadLedgerState(path string) (resumeState, error) {
+	st := resumeState{done: map[string]bool{}, uploaded: map[string]string{}}
 	f, oerr := os.Open(path)
 	if oerr != nil {
 		if errors.Is(oerr, os.ErrNotExist) {
-			return done, uploaded, nil
+			return st, nil
 		}
-		return nil, nil, oerr
+		return resumeState{}, oerr
 	}
 	defer func() { _ = f.Close() }()
 
+	var created []string       // record ids of created rows
+	filed := map[string]bool{} // record ids confirmed filed
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
@@ -112,23 +121,39 @@ func loadLedgerState(path string) (done map[string]bool, uploaded map[string]str
 		if err := json.Unmarshal(line, &r); err != nil {
 			continue // tolerate a partially-written trailing line
 		}
+		switch Action(r.Action) {
+		case ActionFiled:
+			for _, id := range r.Filed {
+				filed[id] = true
+			}
+			continue // marker row: no hash, no record outcome
+		case ActionCreated:
+			if r.DestID != "" {
+				created = append(created, r.DestID)
+			}
+		}
 		if r.Hash == "" {
 			continue
 		}
 		switch Action(r.Action) {
 		case ActionCreated, ActionUpdated, ActionMetadata:
-			done[r.Hash] = true
+			st.done[r.Hash] = true
 		case ActionUploaded:
 			if r.Token != "" {
-				uploaded[r.Hash] = r.Token
+				st.uploaded[r.Hash] = r.Token
 			}
 		}
 	}
 	if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
-		return nil, nil, err
+		return resumeState{}, err
 	}
-	for h := range done {
-		delete(uploaded, h)
+	for h := range st.done {
+		delete(st.uploaded, h)
 	}
-	return done, uploaded, nil
+	for _, id := range created {
+		if !filed[id] {
+			st.unfiled = append(st.unfiled, id)
+		}
+	}
+	return st, nil
 }

@@ -66,6 +66,10 @@ type FieldDefinition struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	DataType string `json:"dataType"`
+	// OptionListItems is the field's option values, returned inline by the
+	// list endpoint for OptionList fields (empty for every other type). The
+	// resolver reads these directly — no per-field GetByID needed.
+	OptionListItems []OptionListItem `json:"items,omitempty"`
 }
 
 // fieldDefinitionPage is the HAL paged envelope we deserialize. The
@@ -80,6 +84,11 @@ type fieldDefinitionPage struct {
 	} `json:"_links"`
 }
 
+// listPageSize is the page size used for every catalog listing. 1000 is
+// Aprimo's max (verified against records search and field definitions), so a
+// typical tenant's catalog comes back in a single page.
+const listPageSize = 1000
+
 // maxFieldDefinitions caps how many entries List will accumulate
 // before returning an error. Sized for real-world tenants (typically
 // a few hundred field defs); if a tenant legitimately exceeds it,
@@ -87,21 +96,12 @@ type fieldDefinitionPage struct {
 // daemon to OOM at startup.
 const maxFieldDefinitions = 10_000
 
-// OptionListItem is one entry in an OptionListFieldDefinition's
-// items array. Aprimo's API returns these embedded inside the field
-// definition when fetched via GetByID (the bulk List endpoint omits
-// them by default).
+// OptionListItem is one entry in an OptionList field's items array.
+// Aprimo returns these inline on both the single-field (GetByID) and the
+// bulk list endpoints, so the resolver gets them straight from List.
 type OptionListItem struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-}
-
-// FieldDefinitionDetail is the fuller view returned by GetByID. It
-// includes type-specific embedded payloads like option list items.
-type FieldDefinitionDetail struct {
-	FieldDefinition
-	// OptionListItems is populated when DataType == "optionlist".
-	OptionListItems []OptionListItem `json:"items,omitempty"`
 }
 
 // normalizeDataType folds Aprimo's PascalCase dataType discriminator
@@ -112,30 +112,16 @@ func normalizeDataType(dt string) string {
 	return strings.ToLower(dt)
 }
 
-// GetByID fetches the full definition of a single field by its
-// GUID. Used by the resolver to pull `items` out of OptionList
-// field definitions for name→id resolution.
-func (fd *FieldDefinitions) GetByID(ctx context.Context, id string) (*FieldDefinitionDetail, error) {
-	var out FieldDefinitionDetail
-	if err := fd.r.getJSON(ctx, "/api/core/fielddefinition/"+id, nil, &out); err != nil {
-		return nil, fmt.Errorf("aprimo: get field definition %s: %w", id, err)
-	}
-	out.DataType = normalizeDataType(out.DataType)
-	return &out, nil
-}
-
-// List walks every page of /api/core/fielddefinitions and returns
-// the full set of {ID, Name, DataType} triples. Pagination is driven
-// by the HAL `_links.next.href` returned in each page; we follow
-// links until none remains.
-//
-// The bulk listing does NOT include type-specific embedded payloads
-// (option list items, classification roots, etc.). For those, follow
-// up with GetByID per field of interest.
+// List walks every page of /api/core/fielddefinitions and returns the full
+// set of definitions, including each OptionList field's items inline — so
+// the resolver builds its option-value maps from this one listing instead
+// of a GetByID per option-list field. Pagination follows the HAL
+// `_links.next.href` until none remains; at pageSize 1000 a typical tenant
+// is a single page.
 func (fd *FieldDefinitions) List(ctx context.Context) ([]FieldDefinition, error) {
 	// Aprimo's listing endpoints take page-size via HTTP header,
 	// not query string — `buildHeaders` in aprimo-js mirrors this.
-	headers := map[string]string{"pageSize": strconv.Itoa(200)}
+	headers := map[string]string{"pageSize": strconv.Itoa(listPageSize)}
 
 	path := "/api/core/fielddefinitions"
 	var out []FieldDefinition

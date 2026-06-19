@@ -988,6 +988,30 @@ func TestConnector_DefaultCollectionFilesNewRecord(t *testing.T) {
 	}
 }
 
+// TestConnector_DeferCollectionAddSkipsPerRecordFiling: even with a
+// DefaultCollection set, the defer_collection_add meta flag (set by the bulk
+// importer) suppresses the per-record filing so the importer can batch it.
+func TestConnector_DeferCollectionAddSkipsPerRecordFiling(t *testing.T) {
+	fake := newFakeAprimo(t)
+	c, _ := newTestConnector(t, fake)
+	c.cfg.DefaultCollection = "coll-target"
+
+	body := writeBody(makeBytes(1024))
+	_, err := c.Write(context.Background(), "x.bin", body, map[string]any{
+		"_job_id":                  "job-coll-deferred",
+		"defer_collection_add":     true,
+		"aprimo_parallel_segments": 1,
+		"aprimo_segment_size":      512,
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(fake.collectionFilings) != 0 {
+		t.Fatalf("defer flag set — expected 0 per-record collection calls, got %d: %+v",
+			len(fake.collectionFilings), fake.collectionFilings)
+	}
+}
+
 // TestConnector_DefaultCollectionFilingFailureIsSwallowed verifies the
 // pragmatic behavior in fileIntoDefaultCollection: if the collection
 // call fails, the record id is still returned (the record exists in
@@ -1172,4 +1196,20 @@ func atoi(s string) int {
 		return -n
 	}
 	return n
+}
+
+// TestVersionedFilesForUpdate_UsesPrefetchedMaster guards the optimization's
+// payoff: when the importer supplies a prefetched master file id, the update
+// builds the version payload from it and never calls the API. c.api is nil
+// here, so any per-record MasterFile GET would panic — that's the regression
+// this catches (the GET-fallback would otherwise hide it).
+func TestVersionedFilesForUpdate_UsesPrefetchedMaster(t *testing.T) {
+	c := &Connector{name: "t"}
+	files, err := c.versionedFilesForUpdate(context.Background(), "rec123", "tok", "a.jpg", "master-abc")
+	if err != nil {
+		t.Fatalf("versionedFilesForUpdate: %v", err)
+	}
+	if len(files.AddOrUpdate) != 1 || files.AddOrUpdate[0].ID != "master-abc" {
+		t.Fatalf("payload must append a version to master-abc, got %+v", files.AddOrUpdate)
+	}
 }

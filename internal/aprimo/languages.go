@@ -44,7 +44,7 @@ const maxLanguages = 1_000
 // set. Pagination mirrors FieldDefinitions.List — page through HAL
 // `_links.next` until none remains.
 func (l *Languages) List(ctx context.Context) ([]Language, error) {
-	headers := map[string]string{"pageSize": strconv.Itoa(200)}
+	headers := map[string]string{"pageSize": strconv.Itoa(listPageSize)}
 
 	path := "/api/core/languages"
 	var out []Language

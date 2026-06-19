@@ -53,6 +53,51 @@ func TestRecordsMasterFile_ParsesID(t *testing.T) {
 	}
 }
 
+// TestResolveMasterFiles pins the wire contract reverse-engineered from the
+// live tenant: a POST to /search/records with select-Record: masterfile and
+// an `Id = "x" OR Id = "y"` expression, parsing each hit's embedded master
+// file. Also guards that a non-record-id value can't be injected into the
+// expression, and that a record with no master is simply absent.
+func TestResolveMasterFiles(t *testing.T) {
+	var gotMethod, gotPath, gotSelect string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotSelect = r.Header.Get("select-Record")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[
+			{"id":"reca","_embedded":{"masterfile":{"id":"filea"}}},
+			{"id":"recb","_embedded":{}}
+		]}`))
+	}))
+	defer srv.Close()
+
+	rs := &Records{r: &requester{client: srv.Client(), auth: stubAuth("tok"), baseURL: srv.URL}}
+
+	// The third value carries a quote+space: it must be filtered out so it
+	// can't malform or inject the OR-chain.
+	got, err := rs.ResolveMasterFiles(context.Background(), []string{"reca", "recb", `x" OR 1=1`})
+	if err != nil {
+		t.Fatalf("ResolveMasterFiles: %v", err)
+	}
+
+	// Only the record with an embedded master file lands in the map.
+	if len(got) != 1 || got["reca"] != "filea" {
+		t.Fatalf("map = %v, want {reca:filea}", got)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/api/core/search/records" {
+		t.Fatalf("request = %s %s, want POST /api/core/search/records", gotMethod, gotPath)
+	}
+	if gotSelect != "masterfile" {
+		t.Fatalf("select-Record = %q, want masterfile", gotSelect)
+	}
+	se, _ := gotBody["searchExpression"].(map[string]any)
+	if expr, _ := se["expression"].(string); expr != `Id = "reca" OR Id = "recb"` {
+		t.Fatalf("expression = %q, want OR-chain of valid ids only (injection id dropped)", expr)
+	}
+}
+
 // TestRecordsMasterFile_NotFound covers the case where the record has
 // no master file. The error chain must match ErrNotFound so callers can
 // branch (the connector falls back to a Create-shape payload).

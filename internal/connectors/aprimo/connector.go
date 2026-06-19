@@ -608,7 +608,11 @@ func (c *Connector) createRecord(
 	if err != nil {
 		return "", fmt.Errorf("aprimo[%s]: create record for %s: %w", c.name, filename, err)
 	}
-	if c.cfg.DefaultCollection != "" {
+	// The bulk importer defers filing so it can batch all new records into
+	// the collection in chunks (and track them in its ledger) rather than
+	// one call per record. The streaming daemon files per-record here.
+	deferred, _ := meta["defer_collection_add"].(bool)
+	if c.cfg.DefaultCollection != "" && !deferred {
 		c.fileIntoDefaultCollection(ctx, resp.ID)
 	}
 	return resp.ID, nil
@@ -639,7 +643,11 @@ func (c *Connector) updateRecord(
 	recordID, uploadToken, filename string,
 	meta map[string]any,
 ) error {
-	files, err := c.versionedFilesForUpdate(ctx, recordID, uploadToken, filename)
+	// The importer resolves master files up front in batched search calls
+	// and passes the result here, letting the update skip the per-record
+	// MasterFile GET. Empty → versionedFilesForUpdate does the lookup.
+	prefetchedMaster, _ := meta["dest_master_file_id"].(string)
+	files, err := c.versionedFilesForUpdate(ctx, recordID, uploadToken, filename, prefetchedMaster)
 	if err != nil {
 		return fmt.Errorf("aprimo[%s]: update record %s: %w", c.name, recordID, err)
 	}
@@ -674,8 +682,12 @@ func (c *Connector) updateRecord(
 // upload becomes a new file on the record.
 func (c *Connector) versionedFilesForUpdate(
 	ctx context.Context,
-	recordID, uploadToken, filename string,
+	recordID, uploadToken, filename, prefetchedMasterID string,
 ) (*aprimo.Files, error) {
+	// Resolved up front in a batched search — no per-record GET needed.
+	if prefetchedMasterID != "" {
+		return aprimo.NewVersionFilesUpdate(uploadToken, filename, prefetchedMasterID), nil
+	}
 	master, err := c.api.Records.MasterFile(ctx, recordID)
 	if err != nil {
 		if errors.Is(err, aprimo.ErrNotFound) {
@@ -687,6 +699,33 @@ func (c *Connector) versionedFilesForUpdate(
 		return aprimo.NewFilesFromUpload(uploadToken, filename), nil
 	}
 	return aprimo.NewVersionFilesUpdate(uploadToken, filename, master.ID), nil
+}
+
+// ResolveMasterFiles batch-resolves the current master file id for many
+// records in a few search calls, so the importer's update path can skip the
+// per-record MasterFile GET. Delegates to the SDK; see
+// aprimo.Records.ResolveMasterFiles. The importer calls this; the streaming
+// daemon doesn't (it resolves at write time to stay correct across UI edits).
+func (c *Connector) ResolveMasterFiles(ctx context.Context, recordIDs []string) (map[string]string, error) {
+	return c.api.Records.ResolveMasterFiles(ctx, recordIDs)
+}
+
+// DefaultCollection is the configured collection new records are filed into
+// (empty when none is set). The importer reads it to decide whether to batch
+// filing; with the defer_collection_add meta flag set, createRecord skips its
+// per-record filing and leaves it to the importer's batched path.
+func (c *Connector) DefaultCollection() string {
+	return c.cfg.DefaultCollection
+}
+
+// AddRecordsToCollection files the given records into the default collection
+// in chunks, instead of one call per record. No-op when no default
+// collection is configured or no ids are given.
+func (c *Connector) AddRecordsToCollection(ctx context.Context, recordIDs []string) error {
+	if c.cfg.DefaultCollection == "" || len(recordIDs) == 0 {
+		return nil
+	}
+	return c.api.Collections.AddRecords(ctx, c.cfg.DefaultCollection, recordIDs)
 }
 
 // WriteMetadata PATCHes fields on an existing record without touching

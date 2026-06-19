@@ -109,6 +109,14 @@ func runImport(args []string, stdout io.Writer) error {
 	// Build with a nil store: no upload markers, no lockfile, no data
 	// dir. Init still authenticates and prefetches the Aprimo catalog so
 	// field-name resolution (and dry-run validation) works.
+	//
+	// An import validates against and runs on a single catalog snapshot — it
+	// never re-pulls mid-run, so a row referencing something not in the
+	// snapshot just errors. The connector's Init otherwise starts the
+	// daemon's periodic catalog refresh (shared code path); pin it off here.
+	if destSpec.Config != nil {
+		destSpec.Config["refresh_interval"] = "0"
+	}
 	var noStore *store.Store
 	logger.Info("connecting", "destination", dest)
 	if err := pool.Build(ctx, destSpec.Name, destSpec.Type, destSpec.Config, noStore); err != nil {

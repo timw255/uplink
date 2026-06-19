@@ -74,6 +74,10 @@ const (
 	// yet. It is never counted in the summary; resume reads it to skip a
 	// re-upload.
 	ActionUploaded Action = "uploaded"
+	// ActionFiled is a ledger-only marker row: the records listed in its
+	// Filed field were filed into the default collection. Never counted in
+	// the summary; resume reads it to skip re-filing already-filed records.
+	ActionFiled Action = "filed"
 )
 
 // validStatuses is the set Aprimo accepts for a record's lifecycle

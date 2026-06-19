@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -80,6 +81,123 @@ func TestAbortReportsInflightAsNotProcessed(t *testing.T) {
 	if got := sum.Failed + sum.Aborted + sum.Created; got != n {
 		t.Fatalf("accounting off: failed=%d aborted=%d created=%d sum=%d, want %d",
 			sum.Failed, sum.Aborted, sum.Created, got, n)
+	}
+}
+
+// TestImportPrefetchesMasterFileForUpdate: an update-with-file record must
+// have its master file resolved up front and the id handed to CreateFromToken
+// via meta, so the connector skips the per-record MasterFile GET.
+func TestImportPrefetchesMasterFileForUpdate(t *testing.T) {
+	line := `{"id":"rec123","file":"photos/a.jpg","fields":[{"name":"T","value":"x"}]}`
+	manifest := writeManifest(t, line)
+	dest := &fakeDest{resolveMaster: map[string]string{"rec123": "master-abc"}}
+	src := &fakeSource{files: map[string]int64{"photos/a.jpg": 10}}
+
+	sum := runImporter(t, Options{ManifestPath: manifest, Dest: dest, Source: src})
+
+	if sum.Updated != 1 {
+		t.Fatalf("summary = %+v (want 1 updated)", sum)
+	}
+	if len(dest.resolveIDs) != 1 || dest.resolveIDs[0] != "rec123" {
+		t.Fatalf("resolveIDs = %v, want exactly [rec123]", dest.resolveIDs)
+	}
+	if len(dest.creates) != 1 {
+		t.Fatalf("creates = %d, want 1", len(dest.creates))
+	}
+	if got, _ := dest.creates[0].meta["dest_master_file_id"].(string); got != "master-abc" {
+		t.Fatalf("dest_master_file_id reaching CreateFromToken = %q, want master-abc", got)
+	}
+}
+
+// TestImportBatchFilesCreatedRecords: with a default collection, the
+// importer suppresses per-record filing (defer flag on the create meta),
+// batch-files every created record once, and records a ledger marker so a
+// resume sees nothing left to file.
+func TestImportBatchFilesCreatedRecords(t *testing.T) {
+	manifest := writeManifest(t,
+		`{"file":"a.jpg","fields":[{"name":"T","value":"x"}]}`,
+		`{"file":"b.jpg","fields":[{"name":"T","value":"y"}]}`,
+	)
+	dest := &fakeDest{collection: "coll-1"}
+	src := &fakeSource{files: map[string]int64{"a.jpg": 10, "b.jpg": 20}}
+	ledgerPath := filepath.Join(t.TempDir(), "led.jsonl")
+
+	sum := runImporter(t, Options{ManifestPath: manifest, Dest: dest, Source: src, ResultsPath: ledgerPath})
+	if sum.Created != 2 {
+		t.Fatalf("created = %d, want 2", sum.Created)
+	}
+	// Per-record filing must be suppressed: every create carried the flag.
+	for _, c := range dest.creates {
+		if d, _ := c.meta["defer_collection_add"].(bool); !d {
+			t.Fatalf("create for %s missing defer_collection_add", c.path)
+		}
+	}
+	// Both created records filed exactly once, in a batch.
+	if got := dest.filedIDs(); len(got) != 2 {
+		t.Fatalf("filed = %v, want 2 records", got)
+	}
+	// Ledger marker written → resume has nothing left to file.
+	st, err := loadLedgerState(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.unfiled) != 0 {
+		t.Fatalf("unfiled after a clean run = %v, want none", st.unfiled)
+	}
+}
+
+// TestImportResumeFilesUnfiledRecords: if a prior run created records but
+// crashed before writing the filed marker, a resume re-files them — the
+// ledger is the only record of what's been filed.
+func TestImportResumeFilesUnfiledRecords(t *testing.T) {
+	// Seed a ledger as if a prior run created two records but never filed.
+	manifest := writeManifest(t,
+		`{"file":"a.jpg","fields":[{"name":"T","value":"x"}]}`,
+		`{"file":"b.jpg","fields":[{"name":"T","value":"y"}]}`,
+	)
+	h1 := hashLine([]byte(`{"file":"a.jpg","fields":[{"name":"T","value":"x"}]}`))
+	h2 := hashLine([]byte(`{"file":"b.jpg","fields":[{"name":"T","value":"y"}]}`))
+	ledgerPath := seedLedger(t,
+		Result{Line: 1, Hash: h1, Action: string(ActionCreated), DestID: "rec-a"},
+		Result{Line: 2, Hash: h2, Action: string(ActionCreated), DestID: "rec-b"},
+		// no "filed" marker — the crash happened before filing
+	)
+
+	dest := &fakeDest{collection: "coll-1"}
+	src := &fakeSource{files: map[string]int64{"a.jpg": 10, "b.jpg": 20}}
+	sum := runImporter(t, Options{
+		ManifestPath: manifest, Dest: dest, Source: src,
+		ResultsPath: ledgerPath, Resume: true,
+	})
+	// Both records were already created → skipped, not re-created.
+	if sum.Skipped != 2 || sum.Created != 0 {
+		t.Fatalf("summary = %+v (want 2 skipped, 0 created)", sum)
+	}
+	// But the unfiled records get filed on resume.
+	got := dest.filedIDs()
+	if len(got) != 2 || !slices.Contains(got, "rec-a") || !slices.Contains(got, "rec-b") {
+		t.Fatalf("filed on resume = %v, want [rec-a rec-b]", got)
+	}
+}
+
+// TestLoadLedgerState_Unfiled covers the resume math: created record ids
+// with no "filed" marker are reported unfiled; filed ones are not.
+func TestLoadLedgerState_Unfiled(t *testing.T) {
+	path := seedLedger(t,
+		Result{Line: 1, Hash: "h1", Action: string(ActionCreated), DestID: "rec-a"},
+		Result{Line: 2, Hash: "h2", Action: string(ActionCreated), DestID: "rec-b"},
+		Result{Line: 3, Hash: "h3", Action: string(ActionCreated), DestID: "rec-c"},
+		Result{Action: string(ActionFiled), Filed: []string{"rec-a", "rec-b"}},
+	)
+	st, err := loadLedgerState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.unfiled) != 1 || st.unfiled[0] != "rec-c" {
+		t.Fatalf("unfiled = %v, want [rec-c]", st.unfiled)
+	}
+	if len(st.done) != 3 {
+		t.Fatalf("done = %d, want 3 (all creates)", len(st.done))
 	}
 }
 

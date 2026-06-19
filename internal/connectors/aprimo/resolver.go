@@ -128,19 +128,14 @@ func buildResolver(ctx context.Context, api *aprimo.Client, defaultLanguage stri
 		}
 	}
 
-	// OptionList items: fetch each option-list field definition's full
-	// detail to pull its items[] array. Bounded by the number of
-	// option-list fields in the tenant (usually <100).
+	// OptionList items come back inline on the field listing, so build the
+	// name→id maps straight from it — no per-field GetByID.
 	for _, f := range fields {
 		if f.DataType != aprimo.DataTypeOptionList {
 			continue
 		}
-		detail, err := api.FieldDefinitions.GetByID(ctx, f.ID)
-		if err != nil {
-			return nil, fmt.Errorf("prefetch option items for field %q: %w", f.Name, err)
-		}
-		items := make(map[string]string, len(detail.OptionListItems))
-		for _, it := range detail.OptionListItems {
+		items := make(map[string]string, len(f.OptionListItems))
+		for _, it := range f.OptionListItems {
 			if n := strings.ToLower(strings.TrimSpace(it.Name)); n != "" {
 				items[n] = it.ID
 			}

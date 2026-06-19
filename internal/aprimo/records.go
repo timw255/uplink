@@ -3,8 +3,11 @@ package aprimo
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/url"
+	"slices"
+	"strings"
 )
 
 // Records is the records resource. It covers what the connector's
@@ -199,6 +202,83 @@ func (rs *Records) MasterFile(ctx context.Context, recordID string) (MasterFileR
 		return MasterFileRef{}, err
 	}
 	return out, nil
+}
+
+// masterFileBatchSize bounds how many record ids go into one search call.
+// Aprimo's search caps results at pageSize=1000; the OR-chain expression
+// itself handles far more (verified well past 2000 ids), so 1000 is the
+// effective per-call batch.
+const masterFileBatchSize = 1000
+
+// searchRecordsResult is the slice of the /search/records response the
+// master-file resolver reads: each hit's record id plus its embedded master
+// file (present when the request carries select-Record: masterfile).
+type searchRecordsResult struct {
+	Items []struct {
+		ID       string `json:"id"`
+		Embedded struct {
+			MasterFile struct {
+				ID string `json:"id"`
+			} `json:"masterfile"`
+		} `json:"_embedded"`
+	} `json:"items"`
+}
+
+// ResolveMasterFiles batch-resolves the current master file id for many
+// records in one search call per 1000 ids, rather than one MasterFile GET
+// per record — the difference between hundreds of calls and hundreds of
+// thousands on an update-heavy import.
+//
+// It searches `Id = "x" OR Id = "y" OR …` with select-Record: masterfile and
+// reads each hit's embedded master file. The returned map is
+// recordID → masterFileID; records with no master file (or that no longer
+// exist) are simply absent, and the caller should fall back to a single
+// MasterFile lookup for those. Ids that aren't well-formed record ids are
+// skipped so a stray value can't malform the expression.
+func (rs *Records) ResolveMasterFiles(ctx context.Context, recordIDs []string) (map[string]string, error) {
+	out := make(map[string]string, len(recordIDs))
+	for chunk := range slices.Chunk(recordIDs, masterFileBatchSize) {
+		clauses := make([]string, 0, len(chunk))
+		for _, id := range chunk {
+			if isRecordID(id) {
+				clauses = append(clauses, `Id = "`+id+`"`)
+			}
+		}
+		if len(clauses) == 0 {
+			continue
+		}
+		body := map[string]any{
+			"searchExpression": map[string]any{"expression": strings.Join(clauses, " OR ")},
+		}
+		path := fmt.Sprintf("/api/core/search/records?page=1&pageSize=%d", len(clauses))
+		var resp searchRecordsResult
+		if err := rs.r.postJSON(ctx, path, body, &resp, map[string]string{"select-Record": "masterfile"}); err != nil {
+			return nil, err
+		}
+		for _, it := range resp.Items {
+			if it.ID != "" && it.Embedded.MasterFile.ID != "" {
+				out[it.ID] = it.Embedded.MasterFile.ID
+			}
+		}
+	}
+	return out, nil
+}
+
+// isRecordID reports whether s is a bare alphanumeric token (the shape of an
+// Aprimo record id). Used to keep arbitrary input — anything that could
+// carry a quote and break the search expression — out of the OR-chain.
+func isRecordID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // Delete permanently removes a record. Cannot be undone.

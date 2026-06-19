@@ -44,7 +44,7 @@ const maxClassifications = 100_000
 // List walks every page of /api/core/classifications and returns the
 // full taxonomy. Pagination mirrors FieldDefinitions.List.
 func (cs *Classifications) List(ctx context.Context) ([]Classification, error) {
-	headers := map[string]string{"pageSize": strconv.Itoa(200)}
+	headers := map[string]string{"pageSize": strconv.Itoa(listPageSize)}
 
 	path := "/api/core/classifications"
 	var out []Classification

@@ -16,8 +16,8 @@ func TestFieldDefinitionsList_SinglePage(t *testing.T) {
 		if r.URL.Path != "/api/core/fielddefinitions" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
-		if r.Header.Get("pageSize") != "200" {
-			t.Errorf("pageSize header = %q, want 200", r.Header.Get("pageSize"))
+		if r.Header.Get("pageSize") != "1000" {
+			t.Errorf("pageSize header = %q, want 1000", r.Header.Get("pageSize"))
 		}
 		w.Header().Set("Content-Type", "application/hal+json")
 		_, _ = fmt.Fprintln(w, `{
@@ -86,34 +86,6 @@ func TestFieldDefinitionsList_NormalizesDataTypeCasing(t *testing.T) {
 	}
 }
 
-func TestFieldDefinitions_GetByID_NormalizesDataTypeCasing(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/hal+json")
-		_, _ = fmt.Fprintln(w, `{
-			"id": "fd-1",
-			"name": "Department",
-			"dataType": "OptionList",
-			"items": [{"id": "opt-1", "name": "Marketing"}]
-		}`)
-	}))
-	defer srv.Close()
-
-	fd := &FieldDefinitions{r: &requester{
-		client:  srv.Client(),
-		auth:    stubAuth("tok"),
-		baseURL: srv.URL,
-		headers: map[string]string{"Accept": "application/hal+json"},
-	}}
-
-	got, err := fd.GetByID(context.Background(), "fd-1")
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if got.DataType != DataTypeOptionList {
-		t.Errorf("DataType = %q, want %q", got.DataType, DataTypeOptionList)
-	}
-}
-
 func TestFieldDefinitionsList_FollowsHALNextLinks(t *testing.T) {
 	var hits atomic.Int32
 	var srv *httptest.Server
@@ -162,19 +134,23 @@ func TestFieldDefinitionsList_FollowsHALNextLinks(t *testing.T) {
 	}
 }
 
-func TestFieldDefinitions_GetByID_DecodesOptionListItems(t *testing.T) {
+// TestFieldDefinitionsList_DecodesOptionListItemsInline guards the
+// optimization: the bulk listing carries each OptionList field's items, so
+// the resolver builds its option maps from List alone — no per-field GetByID.
+// If a refactor stops decoding inline items, this fails.
+func TestFieldDefinitionsList_DecodesOptionListItemsInline(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/core/fielddefinition/fd-1" {
-			t.Errorf("path = %q", r.URL.Path)
+		if r.URL.Path != "/api/core/fielddefinitions" {
+			t.Errorf("path = %q, want the bulk listing", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/hal+json")
 		_, _ = fmt.Fprintln(w, `{
-			"id": "fd-1",
-			"name": "Department",
-			"dataType": "optionlist",
 			"items": [
-				{"id": "opt-1", "name": "Marketing"},
-				{"id": "opt-2", "name": "Engineering"}
+				{"id": "fd-1", "name": "Department", "dataType": "OptionList", "items": [
+					{"id": "opt-1", "name": "Marketing"},
+					{"id": "opt-2", "name": "Engineering"}
+				]},
+				{"id": "fd-2", "name": "Title", "dataType": "SingleLineText"}
 			]
 		}`)
 	}))
@@ -187,18 +163,22 @@ func TestFieldDefinitions_GetByID_DecodesOptionListItems(t *testing.T) {
 		headers: map[string]string{"Accept": "application/hal+json"},
 	}}
 
-	got, err := fd.GetByID(context.Background(), "fd-1")
+	defs, err := fd.List(context.Background())
 	if err != nil {
-		t.Fatalf("GetByID: %v", err)
+		t.Fatalf("List: %v", err)
 	}
-	if got.DataType != "optionlist" {
-		t.Errorf("DataType = %q", got.DataType)
+	if len(defs) != 2 {
+		t.Fatalf("defs = %d, want 2", len(defs))
 	}
-	if len(got.OptionListItems) != 2 {
-		t.Fatalf("items len = %d", len(got.OptionListItems))
+	if defs[0].DataType != DataTypeOptionList {
+		t.Errorf("defs[0].DataType = %q, want optionlist", defs[0].DataType)
 	}
-	if got.OptionListItems[0].Name != "Marketing" {
-		t.Errorf("items[0] = %+v", got.OptionListItems[0])
+	if len(defs[0].OptionListItems) != 2 || defs[0].OptionListItems[0].Name != "Marketing" {
+		t.Fatalf("inline option items not decoded: %+v", defs[0].OptionListItems)
+	}
+	// Non-optionlist fields carry no items.
+	if len(defs[1].OptionListItems) != 0 {
+		t.Errorf("non-optionlist field got items: %+v", defs[1].OptionListItems)
 	}
 }
 

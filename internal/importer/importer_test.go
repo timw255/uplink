@@ -58,6 +58,42 @@ type fakeDest struct {
 	// until ctx is canceled, then returns ctx.Err() — simulating the
 	// in-flight records that get aborted when the run stops.
 	blockCreateUntilCancel bool
+	// resolveMaster: when set, fakeDest implements masterFileResolver and
+	// returns this map; resolveIDs records what it was asked to resolve.
+	resolveMaster map[string]string
+	resolveIDs    []string
+	// collection: when set, fakeDest is a collectionFiler; filed records the
+	// batch-filed ids; fileErr makes AddRecordsToCollection fail.
+	collection string
+	filed      []string
+	fileErr    error
+}
+
+func (d *fakeDest) ResolveMasterFiles(_ context.Context, ids []string) (map[string]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.resolveIDs = append(d.resolveIDs, ids...)
+	return d.resolveMaster, nil
+}
+
+// collection, when set, makes fakeDest a collectionFiler; filed records the
+// ids it was asked to batch-file.
+func (d *fakeDest) DefaultCollection() string { return d.collection }
+
+func (d *fakeDest) AddRecordsToCollection(_ context.Context, ids []string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.fileErr != nil {
+		return d.fileErr
+	}
+	d.filed = append(d.filed, ids...)
+	return nil
+}
+
+func (d *fakeDest) filedIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.filed...)
 }
 
 func (d *fakeDest) UploadOnly(_ context.Context, srcPath string, _ connector.SegmentSource, meta map[string]any) (string, error) {
@@ -333,12 +369,12 @@ func TestRunWritesLedgerAndResumes(t *testing.T) {
 	}
 
 	// Ledger should hold two success rows.
-	done, _, err := loadLedgerState(ledgerPath)
+	st, err := loadLedgerState(ledgerPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(done) != 2 {
-		t.Fatalf("ledger done set = %d, want 2", len(done))
+	if len(st.done) != 2 {
+		t.Fatalf("ledger done set = %d, want 2", len(st.done))
 	}
 
 	// Second run resuming: both lines already done => skipped, no

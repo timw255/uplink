@@ -35,7 +35,7 @@ const maxUsers = 100_000
 
 // List walks every page of /api/core/users and returns the full set.
 func (u *Users) List(ctx context.Context) ([]User, error) {
-	headers := map[string]string{"pageSize": strconv.Itoa(200)}
+	headers := map[string]string{"pageSize": strconv.Itoa(listPageSize)}
 
 	path := "/api/core/users"
 	var out []User

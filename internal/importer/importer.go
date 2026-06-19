@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"time"
 
@@ -61,6 +62,25 @@ type Destination interface {
 type rateControlled interface {
 	RateLimit() (rps float64, maxConcurrent int)
 	SetRateObserver(obs aprimo.RateObserver)
+}
+
+// masterFileResolver is the optional capability a Destination implements to
+// batch-resolve record → master-file ids (the Aprimo connector does). It
+// lets the update path skip a per-record MasterFile GET — hundreds of search
+// calls instead of hundreds of thousands of GETs on an update-heavy run.
+type masterFileResolver interface {
+	ResolveMasterFiles(ctx context.Context, recordIDs []string) (map[string]string, error)
+}
+
+// collectionFiler is the optional capability a Destination implements to
+// file records into a default collection in batches (the Aprimo connector
+// does). When present, the importer suppresses the connector's per-record
+// filing and instead files all created records in chunks after the run,
+// tracking progress in the ledger — instead of one rate-limited call per
+// record. DefaultCollection is empty when no collection is configured.
+type collectionFiler interface {
+	DefaultCollection() string
+	AddRecordsToCollection(ctx context.Context, recordIDs []string) error
 }
 
 // Concurrency defaults. Uploads run off the rate limiter (bandwidth-bound)
@@ -134,6 +154,9 @@ type Result struct {
 	// Token is set only on an "uploaded" ledger row — the upload token the
 	// bytes landed under, so resume can create from it without re-uploading.
 	Token string `json:"token,omitempty"`
+	// Filed is set only on a "filed" ledger marker row — the record ids
+	// filed into the default collection in one batch, so resume skips them.
+	Filed []string `json:"filed,omitempty"`
 }
 
 // Summary tallies a run.
@@ -155,10 +178,11 @@ type Summary struct {
 }
 
 func (s *Summary) add(r Result) {
-	// "uploaded" is an intermediate ledger row, not a finished record —
-	// the same record also produces a final created/updated row, so
-	// counting it would double-count.
-	if Action(r.Action) == ActionUploaded {
+	// "uploaded" and "filed" are intermediate/marker ledger rows, not
+	// finished records — the same record also produces a final
+	// created/updated row, so counting them would double-count.
+	switch Action(r.Action) {
+	case ActionUploaded, ActionFiled:
 		return
 	}
 	s.Total++
@@ -228,6 +252,59 @@ func (im *Importer) concurrency() (upload, create int) {
 	return upload, create
 }
 
+// resolveMasterFiles batch-resolves the master file id for every
+// update-with-file record up front, so each such record's create skips the
+// per-record MasterFile GET. Best-effort: a destination without the
+// capability, or a failed resolve, just leaves the map empty and the
+// connector falls back to the per-record lookup.
+func (im *Importer) resolveMasterFiles(ctx context.Context, passed []workRecord) map[string]string {
+	r, ok := im.opts.Dest.(masterFileResolver)
+	if !ok {
+		return nil
+	}
+	var ids []string
+	for _, wr := range passed {
+		if wr.rec.action() == ActionUpdated { // id + file → needs the master file
+			ids = append(ids, wr.rec.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	m, err := r.ResolveMasterFiles(ctx, ids)
+	if err != nil {
+		im.logger.Warn("batch master-file resolve failed; using per-record lookup", "err", err)
+		return nil
+	}
+	im.logger.Info("resolved master files up front", "update_records", len(ids), "resolved", len(m))
+	return m
+}
+
+// fileCreatedRecords files every created record into the default collection
+// in chunks, writing a ledger marker after each successful chunk so resume
+// skips it. Chunked at the SDK's batch size so each chunk is exactly one
+// API call and one marker. Filing failures are logged, not fatal: the
+// records exist, and a resume re-files whatever has no marker (idempotent).
+func (im *Importer) fileCreatedRecords(ctx context.Context, filer collectionFiler, l *ledger, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	im.logger.Info("filing records into collection", "records", len(ids), "collection", filer.DefaultCollection())
+	filed := 0
+	for chunk := range slices.Chunk(ids, aprimo.CollectionBatchSize) {
+		if err := filer.AddRecordsToCollection(ctx, chunk); err != nil {
+			im.logger.Warn("collection filing batch failed; resume will retry the rest",
+				"err", err, "filed", filed, "unfiled", len(ids)-filed)
+			return
+		}
+		if werr := l.write(Result{Action: string(ActionFiled), Filed: chunk}); werr != nil {
+			im.logger.Warn("ledger write (filed marker) failed", "err", werr)
+		}
+		filed += len(chunk)
+	}
+	im.logger.Info("collection filing complete", "filed", filed)
+}
+
 // Run loads the manifest, validates + stats every record up front, then
 // drives the two-stage upload→create pipeline (or, for a dry run, just
 // reports validity). Returns a tally. The error is non-nil only for setup
@@ -235,18 +312,26 @@ func (im *Importer) concurrency() (upload, create int) {
 func (im *Importer) Run(ctx context.Context) (Summary, error) {
 	start := time.Now()
 
-	done := map[string]bool{}
-	uploaded := map[string]string{}
+	resume := resumeState{done: map[string]bool{}, uploaded: map[string]string{}}
 	if im.opts.Resume {
 		var err error
-		done, uploaded, err = loadLedgerState(im.opts.ResultsPath)
+		resume, err = loadLedgerState(im.opts.ResultsPath)
 		if err != nil {
 			return Summary{}, fmt.Errorf("load resume ledger: %w", err)
 		}
-		if len(done) > 0 || len(uploaded) > 0 {
-			im.logger.Info("resuming", "already_done", len(done), "pre_uploaded", len(uploaded))
+		if len(resume.done) > 0 || len(resume.uploaded) > 0 || len(resume.unfiled) > 0 {
+			im.logger.Info("resuming", "already_done", len(resume.done),
+				"pre_uploaded", len(resume.uploaded), "unfiled", len(resume.unfiled))
 		}
 	}
+	done, uploaded := resume.done, resume.uploaded
+
+	// Collection filing: when the destination files into a default
+	// collection, batch it (suppress the connector's per-record filing) and
+	// track it in the ledger instead of one rate-limited call per record.
+	filer, filing := im.opts.Dest.(collectionFiler)
+	filing = filing && filer.DefaultCollection() != ""
+	var createdIDs []string // record ids created this run, to file in batches
 
 	ledger, err := newLedger(im.opts.ResultsPath, im.opts.Resume)
 	if err != nil {
@@ -290,6 +375,9 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 			if werr := ledger.write(r); werr != nil {
 				im.logger.Warn("ledger write failed", "line", r.Line, "err", werr)
 			}
+			if filing && Action(r.Action) == ActionCreated && r.DestID != "" {
+				createdIDs = append(createdIDs, r.DestID) // file after the run
+			}
 			sumMu.Lock()
 			summary.add(r)
 			sumMu.Unlock()
@@ -322,13 +410,15 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 	} else {
 		passed := v.prescan(runCtx, recs, results, upload, uploaded)
 		p := &pipeline{
-			dest:       im.opts.Dest,
-			source:     im.opts.Source,
-			results:    results,
-			stats:      stats,
-			logger:     im.logger,
-			uploadCap:  upload,
-			createConc: create,
+			dest:            im.opts.Dest,
+			source:          im.opts.Source,
+			results:         results,
+			stats:           stats,
+			logger:          im.logger,
+			uploadCap:       upload,
+			createConc:      create,
+			masterFiles:     im.resolveMasterFiles(runCtx, passed),
+			deferCollection: filing,
 		}
 		p.run(runCtx, passed, uploaded)
 	}
@@ -337,6 +427,13 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 	<-drainDone
 	close(reportStop)
 	<-reportDone
+
+	// File all created records into the default collection in batches, now
+	// that the drainer has the full set. Prepend any records left unfiled by
+	// a prior run (resume). Re-filing is idempotent, so a crash here is safe.
+	if filing {
+		im.fileCreatedRecords(runCtx, filer, ledger, append(resume.unfiled, createdIDs...))
+	}
 
 	// Records that parsed but never produced a result were abandoned when
 	// the run stopped early — report them as aborted, not failed.

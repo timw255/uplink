@@ -782,7 +782,7 @@ The connector config (`rps`, `direct_upload`, `direct_upload_concurrency`, `sequ
 
 ### The ledger (resume and dedup)
 
-Every real import keeps a small ledger under the data dir, keyed to the (manifest, destination) pair:
+Every import keeps a ledger under the data dir, keyed to the (manifest, destination) pair:
 
 ```
 <data_dir>/imports/<manifest>-<hash>.jsonl
