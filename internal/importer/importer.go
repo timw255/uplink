@@ -92,9 +92,6 @@ type Options struct {
 	// writes nothing.
 	DryRun bool
 
-	// Lenient ignores unknown top-level keys instead of rejecting them.
-	Lenient bool
-
 	// StopOnError aborts the run on the first failing record.
 	StopOnError bool
 
@@ -378,7 +375,7 @@ func (im *Importer) loadRecords(ctx context.Context, done map[string]bool, resul
 			emit(ctx, results, Result{Line: line, Hash: hash, Action: "skipped"})
 			continue
 		}
-		rec, perr := parseLine(raw, im.opts.Lenient)
+		rec, perr := parseLine(raw)
 		if perr != nil {
 			res := Result{Line: line, Hash: hash}
 			if im.opts.DryRun {

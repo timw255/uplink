@@ -35,11 +35,10 @@ func runImport(args []string, stdout io.Writer) error {
 	destName := fset.String("destination", "", "aprimo connector name to import into (default: the sole aprimo connector)")
 	sourceName := fset.String("source", "", "source connector name supplying asset files (required when any record has a \"file\")")
 	dryRun := fset.Bool("dry-run", false, "validate every record (file exists, metadata resolves) without writing")
-	lenient := fset.Bool("lenient", false, "ignore unknown top-level keys instead of rejecting them")
 	stopOnError := fset.Bool("stop-on-error", false, "abort on the first failing record (default: process all, report at end)")
 	restart := fset.Bool("restart", false, "ignore the existing ledger and re-process every record from scratch")
-	maxWorkers := fset.Int("max-workers", 0, "ceiling on concurrent uploads (alias for --upload-concurrency; 0 = default)")
-	uploadConc := fset.Int("upload-concurrency", 0, "ceiling on concurrent blob uploads; the controller ramps up to this (0 = default 32)")
+	maxWorkers := fset.Int("max-workers", 0, "how many files upload at once (alias for --upload-concurrency; 0 = default 32)")
+	uploadConc := fset.Int("upload-concurrency", 0, "how many files upload at once; 0 = default 32 (per-upload throughput auto-tunes)")
 	createConc := fset.Int("create-concurrency", 0, "concurrent record writes; the rate limiter paces these (0 = default 16)")
 	logLevel := fset.String("log-level", "info", "log verbosity (debug|info|warn|error)")
 	if err := fset.Parse(args); err != nil {
@@ -152,7 +151,6 @@ func runImport(args []string, stdout io.Writer) error {
 		SourceName:        *sourceName,
 		DestName:          dest,
 		DryRun:            *dryRun,
-		Lenient:           *lenient,
 		StopOnError:       *stopOnError,
 		ResultsPath:       ledgerPath,
 		Resume:            resume,

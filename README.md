@@ -747,7 +747,7 @@ What each combination does:
 {"id": "cf91775e283644c798f4b2be0127bca2", "fields": [{"name": "Caption", "value": "Coucher de soleil", "language": "fr-FR"}]}
 ```
 
-Unknown top-level keys are **rejected** by default — so a raw export with extra columns (`title`, `contentType`, `modifiedOn`, …) fails loudly, reminding you to move the ones you actually want into a `fields` array. Pass `--lenient` to ignore extra keys instead. Values inside `fields` are coerced per the field's Aprimo data type exactly as in a companion script: a `Numeric` field takes a JSON number, a `TextList` a JSON array of strings, a `ClassificationList` a path like `"Topics/Sports/Football"`, and so on — see [Supported field types](#supported-field-types).
+Unknown top-level keys are **rejected** — so a raw export with extra columns (`title`, `contentType`, `modifiedOn`, …) fails loudly rather than silently dropping data, reminding you to move the ones you actually want into a `fields` array. Values inside `fields` are coerced per the field's Aprimo data type exactly as in a companion script: a `Numeric` field takes a JSON number, a `TextList` a JSON array of strings, a `ClassificationList` a path like `"Topics/Sports/Football"`, and so on — see [Supported field types](#supported-field-types).
 
 ### Dry run first
 
@@ -765,9 +765,20 @@ Aprimo forbids `< > : " / \ | ? *` (and control characters) in a filename, so on
 uplink import --file=records.jsonl --source=fs-in --destination=aprimo-prod
 ```
 
-- `--destination` names an `aprimo` connector from your config; the importer reads its credentials, `rps`, and `max_concurrent` straight from that connector's block. When the config defines exactly one aprimo connector, `--destination` can be omitted.
-- `--source` names the connector the `file` paths are resolved against — any source connector (localfs, s3, azblob, b2). It's required only if some line carries a `file`; a metadata-only manifest doesn't need it.
-- `--stop-on-error` aborts on the first failing line. The default processes the whole manifest and reports failures at the end — the usual bulk-import posture.
+| Flag | Default | What it does |
+|---|---|---|
+| `--file` | *(required)* | Path to the JSONL manifest. |
+| `--destination` | the sole aprimo connector | The `aprimo` connector to import into; its credentials, `rps`, and `max_concurrent` are read from that connector's config block. Can be omitted when exactly one aprimo connector is defined. |
+| `--source` | — | The source connector (`localfs` / `s3` / `azblob` / `b2`) that `file` paths resolve against. Required only when some record carries a `file`; a metadata-only manifest doesn't need it. |
+| `--config` | `uplink.yaml` beside the binary | Path to the YAML config the connectors are defined in. |
+| `--dry-run` | off | Validate every record without writing anything — see [Dry run first](#dry-run-first). |
+| `--stop-on-error` | off | Abort on the first failing record. The default processes the whole manifest and reports failures at the end. |
+| `--restart` | off | Ignore the existing ledger and re-process every record from scratch. |
+| `--upload-concurrency` | 32 | How many files upload at once (`--max-workers` is an alias). The per-upload throughput auto-tunes separately — see [Speed](#speed). |
+| `--create-concurrency` | 16 | Concurrent record writes; the `rps` limiter already paces these. |
+| `--log-level` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. |
+
+The connector config (`rps`, `direct_upload`, `direct_upload_concurrency`, `sequential_reads`, …) lives in the [Connectors](#connectors) section — `--destination` and `--source` just point the importer at those blocks.
 
 ### The ledger (resume and dedup)
 

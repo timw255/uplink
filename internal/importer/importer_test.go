@@ -169,15 +169,14 @@ func runImporter(t *testing.T, opts Options) Summary {
 // --- record-level tests --------------------------------------------------
 
 func TestParseLineRejectsUnknownKeys(t *testing.T) {
-	_, err := parseLine([]byte(`{"id":"x","title":"oops"}`), false)
+	// An unmapped top-level key (a raw-export column) must fail, never get
+	// silently dropped — that's the whole point of strict parsing.
+	_, err := parseLine([]byte(`{"id":"x","title":"oops"}`))
 	if err == nil {
-		t.Fatal("expected unknown-key error in strict mode")
+		t.Fatal("expected an unknown-key error")
 	}
 	if !strings.Contains(err.Error(), "fields") {
 		t.Fatalf("error should hint at fields[]: %v", err)
-	}
-	if _, err := parseLine([]byte(`{"id":"x","title":"oops"}`), true); err != nil {
-		t.Fatalf("lenient mode should ignore unknown keys: %v", err)
 	}
 }
 

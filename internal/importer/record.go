@@ -142,18 +142,15 @@ func (r Record) meta() map[string]any {
 }
 
 // parseLine decodes one manifest line into a Record. Unknown top-level
-// keys are rejected by default so typos (and raw-export columns that
-// belong under fields[]) fail loudly; lenient ignores them. The raw
-// bytes are hashed for the resume ledger.
-func parseLine(raw []byte, lenient bool) (Record, error) {
+// keys are always rejected, so typos and raw-export columns that belong
+// under fields[] fail loudly rather than getting silently dropped.
+func parseLine(raw []byte) (Record, error) {
 	var rec Record
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	if !lenient {
-		dec.DisallowUnknownFields()
-	}
+	dec.DisallowUnknownFields()
 	if err := dec.Decode(&rec); err != nil {
-		if !lenient && strings.Contains(err.Error(), "unknown field") {
-			return Record{}, fmt.Errorf("%w (move export columns into a \"fields\" array, or pass --lenient to ignore extra keys)", err)
+		if strings.Contains(err.Error(), "unknown field") {
+			return Record{}, fmt.Errorf("%w (move export columns into a \"fields\" array)", err)
 		}
 		return Record{}, err
 	}
