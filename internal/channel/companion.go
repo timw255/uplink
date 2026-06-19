@@ -109,17 +109,17 @@ func (r *Registry) MatchCompanions(sourceConnector, fullPath string) []*Companio
 // The pattern grammar accepts these tokens:
 //
 //   - ${basename}    — the asset path with its final extension stripped.
-//                      Matches one path segment; may contain internal dots.
-//                      Required: every companion pattern must include
-//                      ${basename} so the inverse can recover the asset.
+//     Matches one path segment; may contain internal dots.
+//     Required: every companion pattern must include
+//     ${basename} so the inverse can recover the asset.
 //   - ${extension}   — the asset's final extension, no dot. One segment,
-//                      no internal dots.
+//     no internal dots.
 //   - ${name}        — a user-defined named capture (letters/digits/_).
-//                      One segment, no internal dots. Reserved names
-//                      `basename` and `extension` cannot be reused here.
+//     One segment, no internal dots. Reserved names
+//     `basename` and `extension` cannot be reused here.
 //   - *              — anonymous wildcard. One segment, no internal dots.
-//                      Captured positionally; available to the script as
-//                      input.match.wildcards.
+//     Captured positionally; available to the script as
+//     input.match.wildcards.
 //
 // Everything else is a literal, including `.`. Pattern matches operate on
 // the path's basename (final segment); the directory is preserved separately.

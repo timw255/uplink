@@ -108,10 +108,7 @@ func (s *connectorSource) Open(ctx context.Context, start, length int64) (io.Rea
 	if start >= int64(len(s.fallback)) {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	end := start + length
-	if end > int64(len(s.fallback)) {
-		end = int64(len(s.fallback))
-	}
+	end := min(start+length, int64(len(s.fallback)))
 	return io.NopCloser(bytes.NewReader(s.fallback[start:end])), nil
 }
 
@@ -173,9 +170,6 @@ func (r *ReaderSource) Open(_ context.Context, start, length int64) (io.ReadClos
 	if start > int64(len(r.Data)) {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	end := start + length
-	if end > int64(len(r.Data)) {
-		end = int64(len(r.Data))
-	}
+	end := min(start+length, int64(len(r.Data)))
 	return io.NopCloser(bytes.NewReader(r.Data[start:end])), nil
 }

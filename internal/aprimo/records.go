@@ -3,6 +3,7 @@ package aprimo
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/url"
 )
 
@@ -240,8 +241,6 @@ func mergeJSON(base []byte, extras map[string]any) ([]byte, error) {
 	if merged == nil {
 		merged = make(map[string]any, len(extras))
 	}
-	for k, v := range extras {
-		merged[k] = v
-	}
+	maps.Copy(merged, extras)
 	return json.Marshal(merged)
 }

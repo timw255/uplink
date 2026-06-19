@@ -216,7 +216,7 @@ func TestWorkerLoop_IdempotentSyncLogInsert(t *testing.T) {
 		SourceConnector: "fs-in",
 		SourcePath:      "resumed.txt",
 		SourceVersion:   "v1",
-		DestID:  "rec-X",
+		DestID:          "rec-X",
 		Kind:            store.SyncCreate,
 	}); err != nil {
 		t.Fatalf("seed sync_log: %v", err)

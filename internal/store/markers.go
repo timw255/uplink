@@ -25,7 +25,7 @@ import (
 // On crash the engine reads the marker state and drives the next step:
 //   - uploading: resume segments from `segments_done`
 //   - committed: call Records.Create/Update with the retained token,
-//                NO re-upload
+//     NO re-upload
 //   - created: insert sync_log if missing, delete the marker
 //
 // Each transition is an atomic-rename rewrite of the marker file, and
@@ -44,24 +44,24 @@ const (
 // UploadMarker is the on-disk record of an in-flight upload. One file
 // per job at data/uploads/<job_id>.session.json.
 type UploadMarker struct {
-	JobID           string      `json:"job_id"`
-	State           MarkerState `json:"state"`
-	UploadToken     string      `json:"upload_token,omitempty"`
-	SegmentsTotal   int         `json:"segments_total"`
+	JobID         string      `json:"job_id"`
+	State         MarkerState `json:"state"`
+	UploadToken   string      `json:"upload_token,omitempty"`
+	SegmentsTotal int         `json:"segments_total"`
 	// SegmentsDone is the list of segment indices that have committed
 	// successfully. On resume, the uploader skips these. We store the
 	// list (not a count) so out-of-order commits don't lose progress
 	// when a worker resumes mid-batch.
-	SegmentsDone    []int       `json:"segments_done,omitempty"`
-	ExpiresAt       time.Time   `json:"expires_at,omitempty"`
-	Channel         string      `json:"channel"`
-	SourceConnector string      `json:"source_connector"`
-	SourcePath      string      `json:"source_path"`
-	SourceVersion   string      `json:"source_version,omitempty"`
-	DestID  string      `json:"dest_id,omitempty"`
-	UploadPath      string      `json:"upload_path,omitempty"` // path returned by /uploads/segments
-	Filename        string      `json:"filename"`
-	Updated         time.Time   `json:"updated"`
+	SegmentsDone    []int     `json:"segments_done,omitempty"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	Channel         string    `json:"channel"`
+	SourceConnector string    `json:"source_connector"`
+	SourcePath      string    `json:"source_path"`
+	SourceVersion   string    `json:"source_version,omitempty"`
+	DestID          string    `json:"dest_id,omitempty"`
+	UploadPath      string    `json:"upload_path,omitempty"` // path returned by /uploads/segments
+	Filename        string    `json:"filename"`
+	Updated         time.Time `json:"updated"`
 }
 
 // LoadMarker returns the marker for jobID, or (nil, nil) if there

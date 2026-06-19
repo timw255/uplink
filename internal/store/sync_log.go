@@ -27,7 +27,7 @@ type SyncLogEntry struct {
 	SourceConnector string
 	SourcePath      string
 	SourceVersion   string
-	DestID  string
+	DestID          string
 	Kind            SyncKind
 	FileSize        sql.NullInt64
 	FileHash        sql.NullString
@@ -133,10 +133,7 @@ func (s *Store) LookupLatestBatch(ctx context.Context, channel string, paths []s
 	out := make(map[string]*SyncLogEntry, len(paths))
 	const chunk = 500
 	for i := 0; i < len(paths); i += chunk {
-		end := i + chunk
-		if end > len(paths) {
-			end = len(paths)
-		}
+		end := min(i+chunk, len(paths))
 		batch := paths[i:end]
 		if err := s.lookupBatchChunk(ctx, channel, batch, out); err != nil {
 			return nil, err

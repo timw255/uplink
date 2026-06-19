@@ -332,7 +332,7 @@ func ensureDirs(dataDir string) error {
 		filepath.Join(dataDir, "uploads"),
 	}
 	for _, d := range dirs {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+		if err := os.MkdirAll(d, 0o700); err != nil { // holds upload tokens/markers
 			return fmt.Errorf("store: create %s: %w", d, err)
 		}
 	}

@@ -91,7 +91,7 @@ func parseXML(L *lua.LState, s string) (lua.LValue, error) {
 		}
 		if start, ok := tok.(xml.StartElement); ok {
 			name := xmlElemName(start.Name)
-			child, err := readXMLElement(L, dec, start)
+			child, err := readXMLElement(L, dec, start, 1)
 			if err != nil {
 				return nil, err
 			}
@@ -101,7 +101,15 @@ func parseXML(L *lua.LState, s string) (lua.LValue, error) {
 	return root, nil
 }
 
-func readXMLElement(L *lua.LState, dec *xml.Decoder, start xml.StartElement) (lua.LValue, error) {
+// maxXMLDepth bounds element nesting. Real-world XMP/sidecars are a handful
+// of levels deep; the cap keeps a deeply-nested document from overflowing
+// the Go stack through this recursion.
+const maxXMLDepth = 256
+
+func readXMLElement(L *lua.LState, dec *xml.Decoder, start xml.StartElement, depth int) (lua.LValue, error) {
+	if depth > maxXMLDepth {
+		return nil, fmt.Errorf("xml nesting exceeds %d levels", maxXMLDepth)
+	}
 	tbl := L.NewTable()
 	for _, attr := range start.Attr {
 		tbl.RawSetString(xmlElemName(attr.Name), lua.LString(attr.Value))
@@ -117,7 +125,7 @@ func readXMLElement(L *lua.LState, dec *xml.Decoder, start xml.StartElement) (lu
 		case xml.StartElement:
 			hasChildren = true
 			name := xmlElemName(t.Name)
-			child, err := readXMLElement(L, dec, t)
+			child, err := readXMLElement(L, dec, t, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -158,13 +166,13 @@ func xmlElemName(n xml.Name) string {
 // schemas can still reach the element via the local name. Picked so the
 // README examples ("dc:rights", "dc:creator") work out of the box.
 var wellKnownXMLPrefix = map[string]string{
-	"http://purl.org/dc/elements/1.1/":  "dc",
-	"http://ns.adobe.com/xap/1.0/":      "xmp",
-	"http://ns.adobe.com/xap/1.0/rights":"xmpRights",
-	"http://ns.adobe.com/photoshop/1.0/":"photoshop",
-	"http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/":"Iptc4xmpCore",
-	"http://www.w3.org/1999/02/22-rdf-syntax-ns#":"rdf",
-	"adobe:ns:meta/":                    "x",
+	"http://purl.org/dc/elements/1.1/":            "dc",
+	"http://ns.adobe.com/xap/1.0/":                "xmp",
+	"http://ns.adobe.com/xap/1.0/rights":          "xmpRights",
+	"http://ns.adobe.com/photoshop/1.0/":          "photoshop",
+	"http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/": "Iptc4xmpCore",
+	"http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf",
+	"adobe:ns:meta/":                              "x",
 }
 
 // addXMLChild attaches a child to a parent table, promoting to a

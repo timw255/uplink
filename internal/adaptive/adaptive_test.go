@@ -107,7 +107,7 @@ func TestControllerRampsUpUnderTarget(t *testing.T) {
 	c := newController(100, 64, 0)
 	limit := 4
 	achieved := 10.0
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		next := c.Step(Sample{Achieved: achieved, HasBacklog: true}, limit)
 		if next <= limit {
 			t.Fatalf("tick %d: expected growth from %d, got %d", i, limit, next)
@@ -123,7 +123,7 @@ func TestControllerRampsUpUnderTarget(t *testing.T) {
 func TestControllerHoldsAtSaturation(t *testing.T) {
 	c := newController(100, 64, 0)
 	limit := 32
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		next := c.Step(Sample{Achieved: 98, HasBacklog: true}, limit)
 		if next != limit {
 			t.Fatalf("tick %d: expected hold at %d, got %d", i, limit, next)
@@ -140,7 +140,7 @@ func TestControllerBacksOffOnThrottle(t *testing.T) {
 		t.Fatalf("expected back-off below %d, got %d", limit, next)
 	}
 	held := next
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		next = c.Step(Sample{Achieved: 10, HasBacklog: true}, next)
 		if next != held {
 			t.Fatalf("cooldown tick %d: expected hold at %d, got %d", i, held, next)
@@ -152,7 +152,7 @@ func TestControllerShrinksWhenIdle(t *testing.T) {
 	c := newController(100, 64, 1)
 	limit := 32
 	// No backlog => pool should shrink toward the baseline.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		next := c.Step(Sample{Achieved: 0, HasBacklog: false}, limit)
 		if next > limit {
 			t.Fatalf("idle tick %d: pool grew from %d to %d", i, limit, next)
@@ -167,7 +167,7 @@ func TestControllerShrinksWhenIdle(t *testing.T) {
 func TestControllerRespectsBaselineFloor(t *testing.T) {
 	c := newController(100, 64, 4)
 	limit := 8
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		limit = c.Step(Sample{Achieved: 0, HasBacklog: false}, limit)
 	}
 	if limit != 4 {
@@ -178,7 +178,7 @@ func TestControllerRespectsBaselineFloor(t *testing.T) {
 func TestControllerRespectsMaxLimit(t *testing.T) {
 	c := newController(1e9, 10, 0)
 	limit := 8
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		limit = c.Step(Sample{Achieved: 1, HasBacklog: true}, limit)
 	}
 	if limit > 10 {

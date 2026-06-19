@@ -159,17 +159,17 @@ func extractState(body []byte) string {
 		return ""
 	}
 	rest = rest[openQ+1:]
-	closeQ := strings.IndexByte(rest, '"')
-	if closeQ < 0 {
+	before, _, ok := strings.Cut(rest, "\"")
+	if !ok {
 		return ""
 	}
-	return rest[:closeQ]
+	return before
 }
 
 // humanBytes formats n as a short decimal-prefix string.
 func humanBytes(n int64) string {
 	const (
-		_ = iota
+		_  = iota
 		KB = 1 << (10 * iota)
 		MB
 		GB

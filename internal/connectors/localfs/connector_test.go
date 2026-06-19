@@ -151,8 +151,7 @@ func TestReconcileProgressCallback(t *testing.T) {
 
 func TestEventSourceDiff(t *testing.T) {
 	c := newConnector(t, "fs-in")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	dataDir := t.TempDir()
 	s, err := store.Open(ctx, dataDir)

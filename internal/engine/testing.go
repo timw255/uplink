@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,10 +71,7 @@ func (s *StubSource) OpenRange(_ context.Context, path string, start, length int
 	if start >= int64(len(data)) {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	end := start + length
-	if end > int64(len(data)) {
-		end = int64(len(data))
-	}
+	end := min(start+length, int64(len(data)))
 	return io.NopCloser(bytes.NewReader(data[start:end])), nil
 }
 
@@ -81,8 +79,8 @@ func (s *StubSource) OpenRange(_ context.Context, path string, start, length int
 func (s *StubSource) Write(_ context.Context, _ string, _ connector.SegmentSource, _ map[string]any) (connector.Entry, error) {
 	return connector.Entry{}, connector.ErrUnsupported
 }
-func (s *StubSource) Delete(_ context.Context, _ string) error          { return connector.ErrUnsupported }
-func (s *StubSource) Move(_ context.Context, _, _ string) error         { return connector.ErrUnsupported }
+func (s *StubSource) Delete(_ context.Context, _ string) error  { return connector.ErrUnsupported }
+func (s *StubSource) Move(_ context.Context, _, _ string) error { return connector.ErrUnsupported }
 
 // Reconcile is unused by these tests but the interface requires it.
 func (s *StubSource) Reconcile(_ context.Context, _ connector.StateStore, _ connector.ProgressFunc) (connector.ReconcileResult, error) {
@@ -141,12 +139,12 @@ type StubDestination struct {
 	// to a generated "rec-" id per call when empty.
 	ResponseRecordID string
 
-	mu          sync.Mutex
-	failed      atomic.Int32
-	writes      []StubWriteCall
-	metadataMu  sync.Mutex
-	metadata    []StubMetadataCall
-	idSeq       int
+	mu         sync.Mutex
+	failed     atomic.Int32
+	writes     []StubWriteCall
+	metadataMu sync.Mutex
+	metadata   []StubMetadataCall
+	idSeq      int
 }
 
 // WriteMetadata implements connector.MetadataWriter so the companion
@@ -295,8 +293,6 @@ func copyMeta(in map[string]any) map[string]any {
 		return nil
 	}
 	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }

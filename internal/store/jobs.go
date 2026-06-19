@@ -33,7 +33,7 @@ type Job struct {
 	SourceConnector string    `json:"source_connector"`
 	SourcePath      string    `json:"source_path"`
 	SourceVersion   string    `json:"source_version,omitempty"`
-	DestID  string    `json:"dest_id,omitempty"`
+	DestID          string    `json:"dest_id,omitempty"`
 	Payload         []byte    `json:"payload,omitempty"`
 	Attempts        int       `json:"attempts"`
 	NextRunAt       time.Time `json:"next_run_at"`
@@ -258,13 +258,13 @@ type rowScanner interface {
 
 func scanJob(r rowScanner) (*Job, error) {
 	var (
-		j             Job
-		srcVersion    sql.NullString
-		aprimoRecID   sql.NullString
-		payload       []byte
-		nextRunAtStr  string
-		createdAtStr  string
-		lastErr       sql.NullString
+		j            Job
+		srcVersion   sql.NullString
+		aprimoRecID  sql.NullString
+		payload      []byte
+		nextRunAtStr string
+		createdAtStr string
+		lastErr      sql.NullString
 	)
 	if err := r.Scan(
 		&j.ID, &j.ChannelName, &j.Kind, &j.SourceConnector, &j.SourcePath,

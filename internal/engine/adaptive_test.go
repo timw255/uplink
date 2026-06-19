@@ -54,7 +54,7 @@ func TestAdaptivePoolProcessesAllJobs(t *testing.T) {
 	const n = 25
 	files := make(map[string][]byte, n)
 	events := make([]connector.Event, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		name := fmt.Sprintf("file-%02d.txt", i)
 		files[name] = []byte(fmt.Sprintf("content-%d", i))
 		events[i] = connector.Event{

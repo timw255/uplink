@@ -58,7 +58,7 @@ func TestAbortReportsInflightAsNotProcessed(t *testing.T) {
 	const n = 6
 	lines := make([]string, n)
 	files := map[string]int64{}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		name := fmt.Sprintf("f-%02d.bin", i)
 		lines[i] = fmt.Sprintf(`{"file":%q,"fields":[{"name":"T","value":"x"}]}`, name)
 		files[name] = 10

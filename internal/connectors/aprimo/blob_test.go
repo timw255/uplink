@@ -2,8 +2,39 @@ package aprimo
 
 import (
 	"encoding/base64"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
+
+// TestBlockUploader_CloseStopsGoroutines: Close must stop the worker pool,
+// controller, and gate watcher so a rebuilt connector doesn't leak them.
+func TestBlockUploader_CloseStopsGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+	u := newBlockUploader(8, directBlockSize)
+	u.start.Do(u.startWorkers) // workers + controller + gate watcher
+
+	if !eventually(time.Second, func() bool { return runtime.NumGoroutine() > before }) {
+		t.Fatal("worker pool did not start")
+	}
+	u.Close()
+	if !eventually(2*time.Second, func() bool { return runtime.NumGoroutine() <= before+1 }) {
+		t.Fatalf("goroutines did not return to baseline after Close (before=%d, now=%d)",
+			before, runtime.NumGoroutine())
+	}
+}
+
+func eventually(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
+}
 
 func TestPlanBlocks(t *testing.T) {
 	const mib = 1 << 20
@@ -61,6 +92,35 @@ func TestBlockID_FixedWidthAndUnique(t *testing.T) {
 			t.Fatalf("blockID(%d) collides", i)
 		}
 		seen[id] = true
+	}
+}
+
+func TestRedactURLQueries(t *testing.T) {
+	cases := []struct {
+		name, in, secret string
+	}{
+		{"azure SAS", `stage from url: GET "https://acct.blob.core.windows.net/c/k?sv=2022&sig=SECRETSIG&se=x": 403`, "SECRETSIG"},
+		{"s3 presigned", `fetch https://b.s3.amazonaws.com/key?X-Amz-Signature=DEADBEEF&X-Amz-Credential=AKIA failed`, "DEADBEEF"},
+		{"b2 auth", `https://f.backblazeb2.com/file/bucket/k?Authorization=TOKEN123 unreachable`, "TOKEN123"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := redactURLQueries(c.in)
+			if strings.Contains(got, c.secret) {
+				t.Fatalf("secret %q still present after redaction: %q", c.secret, got)
+			}
+			if !strings.Contains(got, "<redacted>") {
+				t.Fatalf("expected a redaction marker, got %q", got)
+			}
+			// The host/path should survive for debuggability.
+			if !strings.Contains(got, "://") {
+				t.Fatalf("redaction ate the URL host: %q", got)
+			}
+		})
+	}
+	// A message with no URL is unchanged.
+	if got := redactURLQueries("plain error, no url"); got != "plain error, no url" {
+		t.Fatalf("non-URL text changed: %q", got)
 	}
 }
 

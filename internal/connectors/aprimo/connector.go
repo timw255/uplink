@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"path"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -172,6 +173,11 @@ func (c *Connector) Close() error {
 		case <-time.After(5 * time.Second):
 			slog.Warn("aprimo: refresh goroutine did not exit within 5s", "connector", c.name)
 		}
+	}
+	// Stop the direct-upload worker pool (and its controller/watcher) so
+	// the connector doesn't leak goroutines when rebuilt within a process.
+	if closer, ok := c.blob.(interface{ Close() }); ok {
+		closer.Close()
 	}
 	return nil
 }
@@ -437,7 +443,11 @@ func (c *Connector) uploadDirect(
 	}
 
 	if err := c.blob.Upload(ctx, du.SASURL, body, filename); err != nil {
-		return "", current, fmt.Errorf("direct blob upload: %w", err)
+		// Blob errors can echo SAS / presigned source URLs (the Azure SDK
+		// dumps response bodies, and net errors carry the request URL).
+		// Strip URL query strings so the embedded credentials don't reach
+		// logs or the persisted job error.
+		return "", current, fmt.Errorf("direct blob upload: %s", redactURLQueries(err.Error()))
 	}
 
 	// Blob exists now, so the token is usable; record it for committed→
@@ -908,10 +918,8 @@ func (c *Connector) fieldsFromMeta(meta map[string]any) (json.RawMessage, error)
 }
 
 func appendUnique(s []int, v int) []int {
-	for _, x := range s {
-		if x == v {
-			return s
-		}
+	if slices.Contains(s, v) {
+		return s
 	}
 	s = append(s, v)
 	sort.Ints(s)

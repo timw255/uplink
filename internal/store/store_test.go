@@ -190,7 +190,7 @@ func TestSyncLogInsertAndLookup(t *testing.T) {
 		SourceConnector: "fs-in",
 		SourcePath:      "hello.txt",
 		SourceVersion:   "v1",
-		DestID:  "rec-1",
+		DestID:          "rec-1",
 		Kind:            SyncCreate,
 	}); err != nil {
 		t.Fatalf("InsertSyncLog: %v", err)
@@ -200,7 +200,7 @@ func TestSyncLogInsertAndLookup(t *testing.T) {
 		SourceConnector: "fs-in",
 		SourcePath:      "hello.txt",
 		SourceVersion:   "v2",
-		DestID:  "rec-1",
+		DestID:          "rec-1",
 		Kind:            SyncUpdate,
 	}); err != nil {
 		t.Fatalf("InsertSyncLog #2: %v", err)
@@ -228,7 +228,7 @@ func TestSyncLogBatchLookup(t *testing.T) {
 			SourceConnector: "src",
 			SourcePath:      p,
 			SourceVersion:   "v1",
-			DestID:  string(rune('R' + i)),
+			DestID:          string(rune('R' + i)),
 			Kind:            SyncCreate,
 		}); err != nil {
 			t.Fatalf("Insert %s: %v", p, err)

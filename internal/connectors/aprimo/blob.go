@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,19 @@ var azureBlobHostSuffixes = []string{
 	".blob.core.windows.net",       // public cloud
 	".blob.core.chinacloudapi.cn",  // Azure China
 	".blob.core.usgovcloudapi.net", // Azure US Government
+}
+
+// urlQueryRe matches an http(s) URL and captures everything before its
+// query string.
+var urlQueryRe = regexp.MustCompile(`(https?://[^\s"'?]+)\?[^\s"']*`)
+
+// redactURLQueries strips the query string from any URL in s. SAS
+// signatures and presigned-URL credentials live in the query
+// (`?sig=...`, `?Authorization=...`, `?X-Amz-Signature=...`), so this keeps
+// the host/path for debugging while removing the secret before it can reach
+// a log line or a persisted job error.
+func redactURLQueries(s string) string {
+	return urlQueryRe.ReplaceAllString(s, "$1?<redacted>")
 }
 
 // isAzureBlobURL reports whether raw is an HTTPS URL pointing at an Azure
@@ -110,6 +124,7 @@ type blockUploader struct {
 	stagedBytes atomic.Int64
 	ctx         context.Context
 	cancel      context.CancelFunc
+	closeOnce   sync.Once
 }
 
 // blockJob is one block ready to stage. stage does the PUT (reading the
@@ -195,10 +210,14 @@ func newBlockUploader(ceiling int, blockSize int64) *blockUploader {
 	return u
 }
 
-// Close stops the controller and worker pool. Safe to call once; the
-// connector owns the uploader's lifetime.
+// Close stops the controller, gate watcher, and worker pool. Idempotent.
+// Call only at connector teardown, when no uploads are in flight (closing
+// the job channel while a producer is submitting would panic).
 func (u *blockUploader) Close() {
-	u.cancel()
+	u.closeOnce.Do(func() {
+		u.cancel()    // stops runController + gate.Watch
+		close(u.jobs) // workers drain any remaining jobs, then exit their range
+	})
 }
 
 // newBlobHTTPClient hands the blob clients a tuned transport instead of the
@@ -218,7 +237,7 @@ func newBlobHTTPClient(budget int) *http.Client {
 func (u *blockUploader) startWorkers() {
 	u.gate.Watch(u.ctx)
 	go u.runController()
-	for i := 0; i < u.ceiling; i++ {
+	for range u.ceiling {
 		go u.worker()
 	}
 }
@@ -366,25 +385,28 @@ func (u *blockUploader) commitFile(ctx context.Context, client *blockblob.Client
 	return nil
 }
 
-// uploadFromURL stages every block server-side: Azure fetches each range
-// from the presigned source URL itself. No local reads, no buffers — this
-// machine just issues the control-plane calls.
-func (u *blockUploader) uploadFromURL(ctx context.Context, client *blockblob.Client, sourceURL string, size, blockSize int64, count int, filename string) error {
+// blockRange is the byte offset and length of block i.
+func blockRange(i int, size, blockSize int64) (offset, length int64) {
+	offset = int64(i) * blockSize
+	length = blockSize
+	if rem := size - offset; rem < length {
+		length = rem
+	}
+	return offset, length
+}
+
+// runBlocks stages every block through the pool, then commits. stage does
+// one block's PUT given its range and id, running on a pool worker. The
+// read-and-stage and server-side-from-URL strategies are just different
+// stage funcs over this same scaffold.
+func (u *blockUploader) runBlocks(ctx context.Context, client *blockblob.Client, filename string, size, blockSize int64, count int, stage func(sctx context.Context, offset, length int64, id string) (int64, error)) error {
 	file, fileCtx, ids := u.newFile(ctx, count)
 	submitted := 0
-	for i := 0; i < count; i++ {
-		offset := int64(i) * blockSize
-		length := blockSize
-		if rem := size - offset; rem < length {
-			length = rem
-		}
-		id, off, ln := ids[i], offset, length
+	for i := range count {
+		offset, length := blockRange(i, size, blockSize)
+		id := ids[i]
 		job := blockJob{ctx: fileCtx, file: file, stage: func(sctx context.Context) (int64, error) {
-			opts := &blockblob.StageBlockFromURLOptions{Range: blob.HTTPRange{Offset: off, Count: ln}}
-			if _, err := client.StageBlockFromURL(sctx, id, sourceURL, opts); err != nil {
-				return 0, fmt.Errorf("stage from url: %w", err)
-			}
-			return ln, nil
+			return stage(sctx, offset, length, id)
 		}}
 		if !u.submit(ctx, fileCtx, job) {
 			break
@@ -394,27 +416,25 @@ func (u *blockUploader) uploadFromURL(ctx context.Context, client *blockblob.Cli
 	return u.commitFile(ctx, client, filename, file, ids, submitted, count)
 }
 
+// uploadFromURL stages every block server-side: Azure fetches each range
+// from the presigned source URL itself. No local reads, no buffers — this
+// machine just issues the control-plane calls.
+func (u *blockUploader) uploadFromURL(ctx context.Context, client *blockblob.Client, sourceURL string, size, blockSize int64, count int, filename string) error {
+	return u.runBlocks(ctx, client, filename, size, blockSize, count, func(sctx context.Context, offset, length int64, id string) (int64, error) {
+		opts := &blockblob.StageBlockFromURLOptions{Range: blob.HTTPRange{Offset: offset, Count: length}}
+		if _, err := client.StageBlockFromURL(sctx, id, sourceURL, opts); err != nil {
+			return 0, fmt.Errorf("stage from url: %w", err)
+		}
+		return length, nil
+	})
+}
+
 // uploadParallel reads each block's range concurrently through the pool and
 // stages it. The default for SSD / object-store sources.
 func (u *blockUploader) uploadParallel(ctx context.Context, client *blockblob.Client, src connector.SegmentSource, size, blockSize int64, count int, filename string) error {
-	file, fileCtx, ids := u.newFile(ctx, count)
-	submitted := 0
-	for i := 0; i < count; i++ {
-		offset := int64(i) * blockSize
-		length := blockSize
-		if rem := size - offset; rem < length {
-			length = rem
-		}
-		id, off, ln := ids[i], offset, length
-		job := blockJob{ctx: fileCtx, file: file, stage: func(sctx context.Context) (int64, error) {
-			return u.readStage(sctx, client, src, off, ln, id)
-		}}
-		if !u.submit(ctx, fileCtx, job) {
-			break
-		}
-		submitted++
-	}
-	return u.commitFile(ctx, client, filename, file, ids, submitted, count)
+	return u.runBlocks(ctx, client, filename, size, blockSize, count, func(sctx context.Context, offset, length int64, id string) (int64, error) {
+		return u.readStage(sctx, client, src, offset, length, id)
+	})
 }
 
 // uploadSequential reads the file front-to-back with one reader — holding
@@ -444,11 +464,8 @@ func (u *blockUploader) uploadSequential(ctx context.Context, client *blockblob.
 
 	file, fileCtx, ids := u.newFile(ctx, count)
 	submitted := 0
-	for i := 0; i < count; i++ {
-		length := blockSize
-		if rem := size - int64(i)*blockSize; rem < length {
-			length = rem
-		}
+	for i := range count {
+		_, length := blockRange(i, size, blockSize)
 		bufp := u.bufPool.Get().(*[]byte)
 		pooled := length <= int64(len(*bufp))
 		var buf []byte
@@ -536,7 +553,7 @@ func planBlocks(size, blockSize int64) (int64, int) {
 // requires every block ID in a blob to decode to the same byte length, so
 // the index is zero-padded to a constant width before encoding.
 func blockID(i int) string {
-	return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%032d", i)))
+	return base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "%032d", i))
 }
 
 // readSeekNopCloser adapts a *bytes.Reader to io.ReadSeekCloser so

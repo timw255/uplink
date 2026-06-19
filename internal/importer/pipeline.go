@@ -107,14 +107,12 @@ func (p *pipeline) partition(passed []workRecord, uploaded map[string]string) (f
 // shared rate limiter inside the connector.
 func (p *pipeline) startCreatePool(ctx context.Context, createWork <-chan createJob) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	for i := 0; i < p.createConc; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range p.createConc {
+		wg.Go(func() {
 			for cj := range createWork {
 				p.results <- p.safeCreate(ctx, cj)
 			}
-		}()
+		})
 	}
 	return &wg
 }
@@ -127,10 +125,8 @@ func (p *pipeline) startCreatePool(ctx context.Context, createWork <-chan create
 // full create queue, not by a gate here.
 func (p *pipeline) startUploadPool(ctx context.Context, sched *scheduler, createWork chan<- createJob, queueDepth int) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	for i := 0; i < p.uploadCap; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range p.uploadCap {
+		wg.Go(func() {
 			for {
 				if ctx.Err() != nil {
 					return // run aborting
@@ -154,7 +150,7 @@ func (p *pipeline) startUploadPool(ctx context.Context, sched *scheduler, create
 					return
 				}
 			}
-		}()
+		})
 	}
 	return &wg
 }

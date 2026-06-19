@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -200,8 +201,8 @@ func newFakeAprimo(t *testing.T) *fakeAprimo {
 		// Sub-resource: /api/core/record/{id}/masterfile — used by the
 		// connector's Update flow to discover the existing master file
 		// id before sending a versioned addOrUpdate.
-		if strings.HasSuffix(path, "/masterfile") {
-			id := strings.TrimSuffix(path, "/masterfile")
+		if before, ok := strings.CutSuffix(path, "/masterfile"); ok {
+			id := before
 			f.mu.Lock()
 			f.masterfileHits = append(f.masterfileHits, id)
 			masterID := f.masterfileID
@@ -1151,12 +1152,7 @@ func makeBytes(n int) []byte {
 }
 
 func containsInt(s []int, v int) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s, v)
 }
 
 func atoi(s string) int {

@@ -328,10 +328,7 @@ func (u *Uploader) uploadSegmented(
 	// hold one segment per upload slot plus the active prefetch
 	// workers, so a producer never blocks unless the consumers are
 	// truly saturated.
-	producerWorkers := opts.PrefetchSegments
-	if producerWorkers < 1 {
-		producerWorkers = 1
-	}
+	producerWorkers := max(opts.PrefetchSegments, 1)
 	bufferDepth := opts.ParallelSegments + producerWorkers
 	ready := make(chan prefetchedSegment, bufferDepth)
 
@@ -340,9 +337,7 @@ func (u *Uploader) uploadSegmented(
 	var nextIndex atomic.Int32
 	var producerWG sync.WaitGroup
 	for w := 0; w < producerWorkers; w++ {
-		producerWG.Add(1)
-		go func() {
-			defer producerWG.Done()
+		producerWG.Go(func() {
 			for {
 				if uploadCtx.Err() != nil {
 					return
@@ -369,7 +364,7 @@ func (u *Uploader) uploadSegmented(
 					return
 				}
 			}
-		}()
+		})
 	}
 	go func() {
 		producerWG.Wait()
@@ -380,10 +375,7 @@ func (u *Uploader) uploadSegmented(
 	sem := make(chan struct{}, opts.ParallelSegments)
 	var wg sync.WaitGroup
 	for chunk := range ready {
-		chunk := chunk
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			select {
 			case sem <- struct{}{}:
 			case <-uploadCtx.Done():
@@ -414,7 +406,7 @@ func (u *Uploader) uploadSegmented(
 			if opts.OnProgress != nil {
 				opts.OnProgress(done, segmentCount)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

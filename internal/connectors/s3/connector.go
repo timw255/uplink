@@ -252,8 +252,8 @@ func (c *Connector) PresignGetURL(ctx context.Context, path string, ttl time.Dur
 func (c *Connector) Write(_ context.Context, _ string, _ connector.SegmentSource, _ map[string]any) (connector.Entry, error) {
 	return connector.Entry{}, connector.ErrUnsupported
 }
-func (c *Connector) Delete(_ context.Context, _ string) error          { return connector.ErrUnsupported }
-func (c *Connector) Move(_ context.Context, _, _ string) error         { return connector.ErrUnsupported }
+func (c *Connector) Delete(_ context.Context, _ string) error  { return connector.ErrUnsupported }
+func (c *Connector) Move(_ context.Context, _, _ string) error { return connector.ErrUnsupported }
 
 // Reconcile walks the bucket+prefix, diffs against persisted state,
 // and emits events for the differences. Reuses the same scan core

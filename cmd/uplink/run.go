@@ -119,9 +119,13 @@ func runDaemon(args []string, bootstrapLogger *slog.Logger) error {
 	slog.SetDefault(logger)
 	_ = bootstrapLogger // intentionally unused after this point
 
-	if err := os.MkdirAll(cfg.Storage.DataDir, 0o755); err != nil {
+	// 0700: the data dir holds the SQLite DB (paths, record IDs, job
+	// payloads) and upload markers/tokens. Chmod too, to tighten a dir a
+	// prior version may have created world-readable. (No-op on Windows.)
+	if err := os.MkdirAll(cfg.Storage.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
+	_ = os.Chmod(cfg.Storage.DataDir, 0o700)
 
 	if err := acquireLock(cfg.Storage.DataDir); err != nil {
 		return err
@@ -224,21 +228,17 @@ func runDaemon(args []string, bootstrapLogger *slog.Logger) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1+len(pool.Sources()))
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		runLockHeartbeat(ctx, cfg.Storage.DataDir, func(err error) {
 			logger.Warn("lockfile heartbeat", "err", err)
 		})
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := eng.Run(ctx); err != nil {
 			errCh <- fmt.Errorf("engine: %w", err)
 		}
-	}()
+	})
 
 	for name, src := range pool.Sources() {
 		wg.Add(1)

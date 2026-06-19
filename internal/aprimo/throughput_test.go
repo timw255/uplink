@@ -56,10 +56,7 @@ func (s *memorySource) Open(_ context.Context, start, length int64) (io.ReadClos
 	if start < 0 || start >= int64(len(s.data)) {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
-	end := start + length
-	if end > int64(len(s.data)) {
-		end = int64(len(s.data))
-	}
+	end := min(start+length, int64(len(s.data)))
 	return io.NopCloser(strings.NewReader(string(s.data[start:end]))), nil
 }
 
@@ -487,13 +484,11 @@ func TestRateLimiter_PacesRequests(t *testing.T) {
 	// paced at RPS, so the batch takes about (total-1)/rps.
 	start := time.Now()
 	var wg sync.WaitGroup
-	for i := 0; i < total; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range total {
+		wg.Go(func() {
 			var out map[string]any
 			_ = c.dam.getJSON(context.Background(), "/test", nil, &out)
-		}()
+		})
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
@@ -543,13 +538,11 @@ func TestRateLimiter_StartsEmpty(t *testing.T) {
 
 	start := time.Now()
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			var out map[string]any
 			_ = c.dam.getJSON(context.Background(), "/test", nil, &out)
-		}()
+		})
 	}
 	wg.Wait()
 	elapsed := time.Since(start)

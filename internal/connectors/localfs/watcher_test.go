@@ -62,8 +62,7 @@ func TestNestedWatchers_PartitionTreeByLongestPrefix(t *testing.T) {
 	defer s.Close()
 
 	src := NewEventSource(c, s)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	var (
 		mu     sync.Mutex

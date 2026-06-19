@@ -76,7 +76,7 @@ func (s *Store) archiveChunk(ctx context.Context, threshold string, limit int, e
 			SourceConnector: e.SourceConnector,
 			SourcePath:      e.SourcePath,
 			SourceVersion:   e.SourceVersion,
-			DestID:  e.DestID,
+			DestID:          e.DestID,
 			Kind:            string(e.Kind),
 		}
 		if e.FileSize.Valid {
@@ -127,9 +127,8 @@ type archiveRow struct {
 	SourceConnector string    `json:"source_connector"`
 	SourcePath      string    `json:"source_path"`
 	SourceVersion   string    `json:"source_version"`
-	DestID  string    `json:"dest_id"`
+	DestID          string    `json:"dest_id"`
 	Kind            string    `json:"kind"`
 	FileSize        *int64    `json:"file_size,omitempty"`
 	FileHash        *string   `json:"file_hash,omitempty"`
 }
-

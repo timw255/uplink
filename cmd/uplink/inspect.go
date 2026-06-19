@@ -63,7 +63,7 @@ func runInspectSync(args []string, out io.Writer) error {
 		"source_connector": entry.SourceConnector,
 		"source_path":      entry.SourcePath,
 		"source_version":   entry.SourceVersion,
-		"dest_id": entry.DestID,
+		"dest_id":          entry.DestID,
 		"kind":             string(entry.Kind),
 	})
 }

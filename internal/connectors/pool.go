@@ -3,6 +3,7 @@ package connectors
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 
 	"github.com/timw255/uplink/internal/connector"
@@ -75,9 +76,7 @@ func (p *Pool) Sources() map[string]connector.EventSource {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	out := make(map[string]connector.EventSource, len(p.sources))
-	for k, v := range p.sources {
-		out[k] = v
-	}
+	maps.Copy(out, p.sources)
 	return out
 }
 

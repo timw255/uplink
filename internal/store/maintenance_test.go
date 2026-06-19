@@ -34,7 +34,7 @@ func TestArchiveOlderThanRemovesRowsAndStreamsJSONL(t *testing.T) {
 			SourceConnector: "fs-in",
 			SourcePath:      "new" + ch,
 			SourceVersion:   "v",
-			DestID:  "rec-new-" + ch,
+			DestID:          "rec-new-" + ch,
 			Kind:            SyncCreate,
 		}); err != nil {
 			t.Fatalf("seed new %s: %v", ch, err)
@@ -90,4 +90,3 @@ func TestArchiveOlderThanEmptyIsNoop(t *testing.T) {
 		t.Fatalf("expected empty buffer, got %q", buf.String())
 	}
 }
-

@@ -98,7 +98,7 @@ func TestDispatchBatch_SyncLogDedupSkipsUnchanged(t *testing.T) {
 		SourceConnector: "fs-in",
 		SourcePath:      "foo.txt",
 		SourceVersion:   "v1",
-		DestID:  "rec-1",
+		DestID:          "rec-1",
 		Kind:            store.SyncCreate,
 	}); err != nil {
 		t.Fatalf("seed sync_log: %v", err)
@@ -131,7 +131,7 @@ func TestDispatchBatch_DifferentVersionRoutesAsUpdate(t *testing.T) {
 		SourceConnector: "fs-in",
 		SourcePath:      "foo.txt",
 		SourceVersion:   "v1",
-		DestID:  "rec-X",
+		DestID:          "rec-X",
 		Kind:            store.SyncCreate,
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -244,14 +244,14 @@ func TestDispatchBatch_LargerThanChunkSize(t *testing.T) {
 
 	ctx := context.Background()
 	const seeded = 600
-	for i := 0; i < seeded; i++ {
+	for i := range seeded {
 		path := pathID(i)
 		if err := st.InsertSyncLog(ctx, store.SyncLogEntry{
 			ChannelName:     "ch1",
 			SourceConnector: "fs-in",
 			SourcePath:      path,
 			SourceVersion:   "v1",
-			DestID:  "rec-" + path,
+			DestID:          "rec-" + path,
 			Kind:            store.SyncCreate,
 		}); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
@@ -259,7 +259,7 @@ func TestDispatchBatch_LargerThanChunkSize(t *testing.T) {
 	}
 
 	events := make([]connector.Event, 0, seeded+1)
-	for i := 0; i < seeded; i++ {
+	for i := range seeded {
 		events = append(events, connector.Event{
 			Connector: "fs-in",
 			Kind:      connector.EventCreate,

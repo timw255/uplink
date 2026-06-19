@@ -5,10 +5,60 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+// A tight, call-less infinite loop must be interrupted by the wall-clock
+// timeout — the VM checks the context every instruction, so this is what
+// bounds a runaway script.
+func TestRuntime_RunawayLoopBoundedByTimeout(t *testing.T) {
+	rt := NewRuntime(slog.Default()).WithTimeout(200 * time.Millisecond)
+	script := compileString(t, rt, "loop", `while true do end`)
+	start := time.Now()
+	if _, err := script.RunAsset(context.Background(), AssetScriptInput{Channel: "c"}); err == nil {
+		t.Fatal("expected the infinite loop to be interrupted, got nil error")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("loop ran %v before stopping — the timeout did not interrupt a tight loop", d)
+	}
+}
+
+// parse_xml should return an error on deeply-nested input rather than
+// recurse without a bound.
+func TestParseXML_DeepNestingRejected(t *testing.T) {
+	rt := NewRuntime(slog.Default())
+	script := compileString(t, rt, "xml", `
+		local deep = string.rep("<a>", 400) .. string.rep("</a>", 400)
+		local ok = pcall(uplink.parse_xml, deep)
+		if ok then uplink.fail("expected parse_xml to error on over-deep xml") end
+		return {}
+	`)
+	if _, err := runAsset(t, script, AssetScriptInput{Channel: "c"}); err != nil {
+		t.Fatalf("script failed: %v", err)
+	}
+}
+
+// A large live process heap must not affect script execution. We don't use
+// gopher-lua's SetMx (it watches total process heap and exits the process
+// at 64 MB); holding ~80 MB live catches a reintroduction here.
+func TestRuntime_SurvivesLargeProcessHeap(t *testing.T) {
+	ballast := make([]byte, 80<<20)
+	for i := 0; i < len(ballast); i += 4096 {
+		ballast[i] = 1 // touch pages so the heap is genuinely resident
+	}
+	runtime.KeepAlive(ballast)
+
+	rt := NewRuntime(slog.Default()).WithTimeout(10 * time.Second)
+	// Long enough to cross several of SetMx's 100ms polls if it were present.
+	script := compileString(t, rt, "work", `local n=0; for i=1,30000000 do n=n+1 end; return {}`)
+	if _, err := script.RunAsset(context.Background(), AssetScriptInput{Channel: "c"}); err != nil {
+		t.Fatalf("script failed: %v", err)
+	}
+	runtime.KeepAlive(ballast)
+}
 
 func compileString(t *testing.T, rt *Runtime, name, src string) *Script {
 	t.Helper()

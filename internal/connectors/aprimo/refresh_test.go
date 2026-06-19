@@ -19,14 +19,14 @@ import (
 // daemon restart — and the swap is atomic so in-flight reads always
 // see a consistent snapshot.
 func TestConnector_BackgroundRefreshSwapsResolver(t *testing.T) {
-	var calls int32 // counts /api/core/fielddefinitions hits
+	var calls atomic.Int32 // counts /api/core/fielddefinitions hits
 
 	mux := http.NewServeMux()
 	// Field definitions: counts each call so we can confirm refresh
 	// fires. Returns "Caption" on call 1, "Caption" + "Subtitle" on
 	// every subsequent call — simulating a field being added.
 	mux.HandleFunc("/api/core/fielddefinitions", func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&calls, 1)
+		n := calls.Add(1)
 		w.Header().Set("Content-Type", "application/hal+json")
 		if n == 1 {
 			fmt.Fprintln(w, `{
@@ -95,7 +95,7 @@ func TestConnector_BackgroundRefreshSwapsResolver(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	// After Init: one fetch happened.
-	if got := atomic.LoadInt32(&calls); got != 1 {
+	if got := calls.Load(); got != 1 {
 		t.Fatalf("after Init: calls = %d, want 1", got)
 	}
 	r1 := c.resolver.Load()
@@ -118,18 +118,18 @@ func TestConnector_BackgroundRefreshSwapsResolver(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("resolver was not refreshed within deadline; calls=%d", atomic.LoadInt32(&calls))
+	t.Fatalf("resolver was not refreshed within deadline; calls=%d", calls.Load())
 }
 
 // TestConnector_RefreshIntervalZeroDisablesGoroutine confirms that
 // setting refresh_interval to 0 skips the background loop entirely —
 // no goroutine, no extra API calls past Init.
 func TestConnector_RefreshIntervalZeroDisablesGoroutine(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/core/fielddefinitions", func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&calls, 1)
+		calls.Add(1)
 		w.Header().Set("Content-Type", "application/hal+json")
 		fmt.Fprintln(w, `{"items": [], "_links": {"self": {"href": "/api/core/fielddefinitions"}}}`)
 	})
@@ -172,7 +172,7 @@ func TestConnector_RefreshIntervalZeroDisablesGoroutine(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	time.Sleep(150 * time.Millisecond)
-	if got := atomic.LoadInt32(&calls); got != 1 {
+	if got := calls.Load(); got != 1 {
 		t.Errorf("with refresh disabled, expected 1 call; got %d", got)
 	}
 	if c.refreshDone != nil {

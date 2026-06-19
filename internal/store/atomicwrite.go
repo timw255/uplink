@@ -21,10 +21,11 @@ func stripBOM(b []byte) []byte {
 // on the same volume. Used by the on-disk upload-marker files.
 func atomicWrite(path string, data []byte) error {
 	tmp := path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// 0600: markers carry the Aprimo upload token + dest record id.
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("store: write tmp: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {

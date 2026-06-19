@@ -296,14 +296,14 @@ func TestCompilePattern_Invalid(t *testing.T) {
 		want string
 	}{
 		{"", "empty"},
-		{"foo.bar", "${basename}"},                                      // no basename
-		{"${basename}/${name}.txt", "must not contain '/'"},             // multi-segment
-		{"${basename}${basename}.txt", "appears more than once"},        // duplicate basename
+		{"foo.bar", "${basename}"}, // no basename
+		{"${basename}/${name}.txt", "must not contain '/'"},      // multi-segment
+		{"${basename}${basename}.txt", "appears more than once"}, // duplicate basename
 		{"${basename}.${extension}.${extension}", "appears more than once"},
 		{"${basename}.${lang}.${lang}.txt", "appears more than once"},
-		{"${basename}.${basename}.txt", "appears more than once"},       // duplicate also caught
-		{"${basename}.${1bad}.txt", "invalid var name"},                 // ident starts with digit
-		{"${basename}.${bad-name}.txt", "invalid var name"},             // ident has dash
+		{"${basename}.${basename}.txt", "appears more than once"}, // duplicate also caught
+		{"${basename}.${1bad}.txt", "invalid var name"},           // ident starts with digit
+		{"${basename}.${bad-name}.txt", "invalid var name"},       // ident has dash
 		{"${basename}.${}.txt", "empty ${}"},
 		{"${basename}.${unterminated.txt", "unterminated"},
 	}

@@ -252,7 +252,7 @@ func TestUploaderSegmented(t *testing.T) {
 
 	// All bytes round-tripped.
 	var rebuilt bytes.Buffer
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		rebuilt.Write(s.segmentBytes[i])
 	}
 	if !bytes.Equal(rebuilt.Bytes(), src) {

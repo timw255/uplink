@@ -121,7 +121,7 @@ func TestStateDelta_LoadStateForChunksBigBatches(t *testing.T) {
 	now := time.Now().UTC()
 	// Seed 1200 paths so chunking (500) has to kick in twice.
 	entries := make([]connector.StateEntry, 0, 1200)
-	for i := 0; i < 1200; i++ {
+	for i := range 1200 {
 		entries = append(entries, connector.StateEntry{
 			Path: testPath(i), Size: int64(i), ModTime: now, Hash: testHash(i),
 		})

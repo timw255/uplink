@@ -367,9 +367,9 @@ func TestE2E_Companion_PresyncIgnoresOtherDirectories(t *testing.T) {
 	rig := newCompanionRig(t,
 		[]channel.ChannelSpec{channelWithCompanion("path.endsWith('.jpg')", "${basename}.xmp", scriptPath)},
 		map[string][]byte{
-			"photos/sunset.jpg":         []byte("JPEG"),
-			"photos/sunset.xmp":         []byte("right-dir"),
-			"photos/other/sunset.xmp":   []byte("wrong-dir"),
+			"photos/sunset.jpg":            []byte("JPEG"),
+			"photos/sunset.xmp":            []byte("right-dir"),
+			"photos/other/sunset.xmp":      []byte("wrong-dir"),
 			"photos/deeper/sub/sunset.xmp": []byte("also-wrong"),
 		},
 	)
@@ -704,9 +704,9 @@ func TestE2E_Companion_PerLanguageCaptions(t *testing.T) {
 			scriptPath,
 		)},
 		map[string][]byte{
-			"photos/sunset.jpg":              []byte("JPEG"),
-			"photos/sunset.caption.en.txt":   []byte("Sunset"),
-			"photos/sunset.caption.fr.txt":   []byte("Coucher"),
+			"photos/sunset.jpg":            []byte("JPEG"),
+			"photos/sunset.caption.en.txt": []byte("Sunset"),
+			"photos/sunset.caption.fr.txt": []byte("Coucher"),
 		},
 	)
 	rig.runOnce([]connector.Event{rig.emit(connector.EventCreate, "photos/sunset.jpg")})

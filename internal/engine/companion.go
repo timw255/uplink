@@ -97,7 +97,7 @@ func (e *Engine) dispatchCompanions(ctx context.Context, classified []companionR
 			SourceConnector: c.event.Connector,
 			SourcePath:      c.event.Entry.Path,
 			SourceVersion:   c.event.Entry.Hash,
-			DestID:  parent.DestID,
+			DestID:          parent.DestID,
 			Payload:         payload,
 		})
 	}

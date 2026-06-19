@@ -42,13 +42,10 @@ func (c *Connector) allWatchers() []connector.WatcherSpec {
 func (s *EventSource) Subscribe(ctx context.Context, handler connector.EventHandler) error {
 	var wg sync.WaitGroup
 	for _, w := range s.watchers {
-		w := w
 		subPrefixes := connector.SubwatcherPrefixes(s.watchers, w)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			s.runWatcherLoop(ctx, w, subPrefixes, handler)
-		}()
+		})
 	}
 	wg.Wait()
 	return nil

@@ -247,7 +247,7 @@ func resolveLedger(dataDir, manifestPath, dest string, dryRun, restart bool) (pa
 		return "", false, fmt.Errorf("resolve manifest path: %w", aerr)
 	}
 	dir := filepath.Join(dataDir, "imports")
-	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+	if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil { // ledger holds upload tokens
 		return "", false, fmt.Errorf("create import ledger dir: %w", mkErr)
 	}
 	path = filepath.Join(dir, ledgerName(abs, dest))

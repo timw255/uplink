@@ -133,10 +133,7 @@ func (s *Store) LoadStateFor(ctx context.Context, scope string, paths []string) 
 	const chunk = 500
 	out := make(map[string]connector.StateEntry, len(paths))
 	for i := 0; i < len(paths); i += chunk {
-		end := i + chunk
-		if end > len(paths) {
-			end = len(paths)
-		}
+		end := min(i+chunk, len(paths))
 		group := paths[i:end]
 		q := `SELECT path, size, mtime, hash, metadata FROM connector_state WHERE scope = ? AND path IN (?` +
 			repeatComma(len(group)-1) + `)`
@@ -316,7 +313,7 @@ func repeatComma(n int) string {
 		return ""
 	}
 	out := make([]byte, 0, n*2)
-	for i := 0; i < n; i++ {
+	for range n {
 		out = append(out, ',', '?')
 	}
 	return string(out)

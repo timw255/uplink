@@ -25,7 +25,7 @@ func TestLookupLatestBatch_OverChunkSize(t *testing.T) {
 			SourceConnector: "src",
 			SourcePath:      paths[i],
 			SourceVersion:   "v" + itoaTest(i),
-			DestID:  "rec-" + itoaTest(i),
+			DestID:          "rec-" + itoaTest(i),
 			Kind:            SyncCreate,
 		}); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
@@ -107,7 +107,7 @@ func TestArchiveOlderThan_ChunkedDeletion(t *testing.T) {
 
 	// Seed 1500 old rows + 500 new ones.
 	oldTS := time.Now().UTC().Add(-72 * time.Hour).Format(time.RFC3339Nano)
-	for i := 0; i < 1500; i++ {
+	for i := range 1500 {
 		if _, err := s.DB().ExecContext(ctx, `
             INSERT INTO sync_log
                 (ts, channel_name, source_connector, source_path,
@@ -118,7 +118,7 @@ func TestArchiveOlderThan_ChunkedDeletion(t *testing.T) {
 			t.Fatalf("seed old %d: %v", i, err)
 		}
 	}
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		if err := s.InsertSyncLog(ctx, SyncLogEntry{
 			ChannelName: "ch", SourceConnector: "src", SourcePath: "new/" + itoaTest(i),
 			SourceVersion: "v", DestID: "rec-new-" + itoaTest(i), Kind: SyncCreate,
@@ -168,7 +168,7 @@ func TestEngineIdempotencyPattern(t *testing.T) {
 		SourceConnector: "src",
 		SourcePath:      "x.bin",
 		SourceVersion:   "v1",
-		DestID:  "rec-1",
+		DestID:          "rec-1",
 		Kind:            SyncCreate,
 	}
 	if err := s.InsertSyncLog(ctx, entry); err != nil {

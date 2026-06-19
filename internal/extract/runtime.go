@@ -22,13 +22,12 @@ import (
 	"github.com/yuin/gopher-lua/parse"
 )
 
-// Runtime defaults. Wall-clock timeout caps a runaway loop; memMB caps
-// per-execution memory; insts is a soft cap enforced by a debug hook.
+// Runtime defaults. A runaway script is bounded by the wall-clock timeout:
+// the Lua VM checks the execution context on every instruction, so even a
+// tight call-less loop is interrupted when the deadline passes.
 const (
-	defaultTimeout      = 5 * time.Second
-	maxTimeout          = 60 * time.Second
-	defaultInstructions = 10_000_000
-	defaultMemoryMB     = 64
+	defaultTimeout = 5 * time.Second
+	maxTimeout     = 60 * time.Second
 )
 
 // Runtime compiles and executes sandboxed Lua scripts. One Runtime is
@@ -38,8 +37,6 @@ const (
 type Runtime struct {
 	logger  *slog.Logger
 	timeout time.Duration
-	insts   int
-	memMB   int
 }
 
 // NewRuntime returns a runtime with sane defaults.
@@ -50,8 +47,6 @@ func NewRuntime(logger *slog.Logger) *Runtime {
 	return &Runtime{
 		logger:  logger,
 		timeout: defaultTimeout,
-		insts:   defaultInstructions,
-		memMB:   defaultMemoryMB,
 	}
 }
 
@@ -202,7 +197,6 @@ func (s *Script) RunCompanion(ctx context.Context, in CompanionInput) ([]any, er
 
 	state := lua.NewState(lua.Options{SkipOpenLibs: true})
 	defer state.Close()
-	state.SetMx(s.rt.memMB)
 	state.SetContext(runCtx)
 
 	for _, lib := range []struct {
@@ -272,7 +266,6 @@ func (s *Script) RunAsset(ctx context.Context, in AssetScriptInput) ([]any, erro
 
 	state := lua.NewState(lua.Options{SkipOpenLibs: true})
 	defer state.Close()
-	state.SetMx(s.rt.memMB)
 	state.SetContext(runCtx)
 
 	for _, lib := range []struct {

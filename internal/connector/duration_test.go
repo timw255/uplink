@@ -8,14 +8,14 @@ import (
 
 func TestParseDuration_AcceptsSecondAndCoarser(t *testing.T) {
 	cases := map[string]time.Duration{
-		"30s":     30 * time.Second,
-		"2m":      2 * time.Minute,
-		"1h":      time.Hour,
-		"2h30m":   2*time.Hour + 30*time.Minute,
-		"1.5h":    90 * time.Minute,
-		"0s":      0,
-		"3600s":   time.Hour,
-		"24h":     24 * time.Hour,
+		"30s":   30 * time.Second,
+		"2m":    2 * time.Minute,
+		"1h":    time.Hour,
+		"2h30m": 2*time.Hour + 30*time.Minute,
+		"1.5h":  90 * time.Minute,
+		"0s":    0,
+		"3600s": time.Hour,
+		"24h":   24 * time.Hour,
 	}
 	for in, want := range cases {
 		got, err := ParseDuration(in)

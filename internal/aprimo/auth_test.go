@@ -21,9 +21,9 @@ func makeJWT(exp int64) string {
 }
 
 func TestClientCredentialsTokenProvider(t *testing.T) {
-	var called int32
+	var called atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&called, 1)
+		called.Add(1)
 		if got := r.FormValue("grant_type"); got != "client_credentials" {
 			t.Errorf("grant_type = %q", got)
 		}
@@ -46,34 +46,34 @@ func TestClientCredentialsTokenProvider(t *testing.T) {
 	if tok != "tok-1" {
 		t.Fatalf("token = %q", tok)
 	}
-	if atomic.LoadInt32(&called) != 1 {
+	if called.Load() != 1 {
 		t.Fatalf("expected 1 call")
 	}
 }
 
 func TestCachedTokenProviderCachesUntilExpiry(t *testing.T) {
-	var called int32
+	var called atomic.Int32
 	inner := func(_ context.Context) (string, error) {
-		atomic.AddInt32(&called, 1)
+		called.Add(1)
 		// far-future expiry
 		return makeJWT(time.Now().Add(1 * time.Hour).Unix()), nil
 	}
 	cp := CachedTokenProvider(inner)
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if _, err := cp(context.Background()); err != nil {
 			t.Fatalf("cp: %v", err)
 		}
 	}
-	if got := atomic.LoadInt32(&called); got != 1 {
+	if got := called.Load(); got != 1 {
 		t.Fatalf("inner called %d times, expected 1", got)
 	}
 }
 
 func TestCachedTokenProviderRefreshesOnExpiry(t *testing.T) {
-	var called int32
+	var called atomic.Int32
 	inner := func(_ context.Context) (string, error) {
-		n := atomic.AddInt32(&called, 1)
+		n := called.Add(1)
 		// First call: expiry inside the 30s refresh-skew window, so the
 		// next cached check will deem the token stale and refresh.
 		// Second call: an hour out, easily cacheable.
@@ -93,7 +93,7 @@ func TestCachedTokenProviderRefreshesOnExpiry(t *testing.T) {
 	if _, err := cp(context.Background()); err != nil {
 		t.Fatalf("second call: %v", err)
 	}
-	if got := atomic.LoadInt32(&called); got != 2 {
+	if got := called.Load(); got != 2 {
 		t.Fatalf("inner called %d times, expected 2", got)
 	}
 }
@@ -103,19 +103,19 @@ func TestCachedTokenProviderRefreshesOnExpiry(t *testing.T) {
 // whose exp is already in the past, we treat it like a token with no
 // expiry information rather than refreshing on every call.
 func TestCachedTokenProviderPastExpDoesNotThrash(t *testing.T) {
-	var called int32
+	var called atomic.Int32
 	inner := func(_ context.Context) (string, error) {
-		atomic.AddInt32(&called, 1)
+		called.Add(1)
 		return makeJWT(time.Now().Add(-1 * time.Hour).Unix()), nil
 	}
 	cp := CachedTokenProvider(inner)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, err := cp(context.Background()); err != nil {
 			t.Fatalf("call %d: %v", i, err)
 		}
 	}
-	if got := atomic.LoadInt32(&called); got != 1 {
+	if got := called.Load(); got != 1 {
 		t.Fatalf("inner called %d times for a token with past exp; want 1 (fallback TTL should keep it cached)", got)
 	}
 }

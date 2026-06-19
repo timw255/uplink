@@ -67,9 +67,9 @@ func TestRequesterAttachesBearerAndHeaders(t *testing.T) {
 }
 
 func TestRequesterRetriesOn429(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	r, _ := newTestRequester(t, func(w http.ResponseWriter, _ *http.Request) {
-		n := atomic.AddInt32(&calls, 1)
+		n := calls.Add(1)
 		if n < 2 {
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -83,7 +83,7 @@ func TestRequesterRetriesOn429(t *testing.T) {
 	if err := r.getJSON(context.Background(), "/x", nil, &map[string]any{}); err != nil {
 		t.Fatalf("getJSON: %v", err)
 	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
+	if got := calls.Load(); got != 2 {
 		t.Fatalf("expected 2 calls (1 retry), got %d", got)
 	}
 }
@@ -133,7 +133,7 @@ func TestRequesterReturnsTypedHTTPErrors(t *testing.T) {
 // retry loop so each attempt builds a fresh reader from the same data.
 func TestRequester_IoReaderBodySurvivesRetry(t *testing.T) {
 	var (
-		calls int32
+		calls atomic.Int32
 		got   [][]byte
 		mu    sync.Mutex
 	)
@@ -142,7 +142,7 @@ func TestRequester_IoReaderBodySurvivesRetry(t *testing.T) {
 		mu.Lock()
 		got = append(got, body)
 		mu.Unlock()
-		if atomic.AddInt32(&calls, 1) < 2 {
+		if calls.Add(1) < 2 {
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
@@ -176,9 +176,9 @@ func TestRequester_IoReaderBodySurvivesRetry(t *testing.T) {
 // forced the engine to retry the entire job — wasteful when a quick
 // SDK-level retry would succeed.
 func TestRequester_RetriesOn5xxForIdempotentMethods(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	r, _ := newTestRequester(t, func(w http.ResponseWriter, _ *http.Request) {
-		if atomic.AddInt32(&calls, 1) < 2 {
+		if calls.Add(1) < 2 {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
@@ -190,7 +190,7 @@ func TestRequester_RetriesOn5xxForIdempotentMethods(t *testing.T) {
 	if err := r.getJSON(context.Background(), "/x", nil, &map[string]any{}); err != nil {
 		t.Fatalf("getJSON: %v", err)
 	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
+	if got := calls.Load(); got != 2 {
 		t.Fatalf("expected 2 calls (1 retry on 502), got %d", got)
 	}
 }
@@ -201,9 +201,9 @@ func TestRequester_RetriesOn5xxForIdempotentMethods(t *testing.T) {
 // retries at the job layer, where the marker state machine handles
 // the duplicate risk.
 func TestRequester_DoesNotRetryPostOn5xx(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	r, _ := newTestRequester(t, func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&calls, 1)
+		calls.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 	}, nil)
 	r.maxRetries = 3
@@ -212,7 +212,7 @@ func TestRequester_DoesNotRetryPostOn5xx(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from POST 502")
 	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
+	if got := calls.Load(); got != 1 {
 		t.Fatalf("expected 1 call (no POST retry on 5xx), got %d", got)
 	}
 }

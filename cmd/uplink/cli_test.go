@@ -276,7 +276,7 @@ func seedOldSyncRows(t *testing.T, dataDir string, n int) {
 	defer st.Close()
 	ctx := context.Background()
 	oldTS := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if _, err := st.DB().ExecContext(ctx, `
             INSERT INTO sync_log
                 (ts, channel_name, source_connector, source_path,

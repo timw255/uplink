@@ -115,10 +115,10 @@ func TestFieldDefinitions_GetByID_NormalizesDataTypeCasing(t *testing.T) {
 }
 
 func TestFieldDefinitionsList_FollowsHALNextLinks(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&hits, 1)
+		n := hits.Add(1)
 		w.Header().Set("Content-Type", "application/hal+json")
 		switch n {
 		case 1:

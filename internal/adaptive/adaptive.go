@@ -225,18 +225,12 @@ func (c *Controller) Step(s Sample, limit int) int {
 		// still lifts throughput, or while small enough that ramping is
 		// obviously safe.
 		if s.Achieved > c.prev*1.05 || limit < 8 {
-			step := limit / 4
-			if step < 2 {
-				step = 2
-			}
+			step := max(limit/4, 2)
 			limit += step
 		}
 	}
 
-	floor := c.Baseline
-	if floor < 1 {
-		floor = 1
-	}
+	floor := max(c.Baseline, 1)
 	if limit < floor {
 		limit = floor
 	}

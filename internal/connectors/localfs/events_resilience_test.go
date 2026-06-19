@@ -74,8 +74,7 @@ func (s *togglingStateStore) SweepStateBelowGeneration(ctx context.Context, scop
 // new files.
 func TestEventSource_SurvivesScanError(t *testing.T) {
 	c := newConnector(t, "fs-in")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	dataDir := t.TempDir()
 	realStore, err := store.Open(ctx, dataDir)
