@@ -122,7 +122,7 @@ func (c *Connector) Name() string { return c.name }
 // — any companion-script field entry that omits `language` will fail
 // loudly.
 func (c *Connector) Init(ctx context.Context) error {
-	res, err := buildResolver(ctx, c.api, c.cfg.DefaultLanguage)
+	res, err := buildResolver(ctx, c.api, c.cfg.DefaultLanguage, c.cfg.catalogUsage)
 	if err != nil {
 		return fmt.Errorf("aprimo[%s]: %w", c.name, err)
 	}
@@ -150,7 +150,7 @@ func (c *Connector) runRefreshLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			fresh, err := buildResolver(ctx, c.api, c.cfg.DefaultLanguage)
+			fresh, err := buildResolver(ctx, c.api, c.cfg.DefaultLanguage, c.cfg.catalogUsage)
 			if err != nil {
 				slog.Warn("aprimo: catalog refresh failed; keeping prior snapshot",
 					"connector", c.name, "err", err)

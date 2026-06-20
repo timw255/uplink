@@ -16,11 +16,13 @@
 package importer
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -159,6 +161,48 @@ func parseLine(raw []byte) (Record, error) {
 		return Record{}, err
 	}
 	return rec, nil
+}
+
+// ScanFieldUsage streams the manifest and returns the distinct field names it
+// references and whether any entry specifies a language. The import command
+// passes these to the Aprimo connector so it prefetches only the catalogs the
+// run's field types need. Malformed lines are tolerated here (they contribute
+// nothing) — the run itself reports parse errors per line.
+func ScanFieldUsage(path string) (fieldNames []string, usesLanguage bool, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	seen := map[string]bool{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		raw := bytes.TrimSpace(sc.Bytes())
+		if len(raw) == 0 {
+			continue
+		}
+		var line struct {
+			Fields []FieldEntry `json:"fields"`
+		}
+		if json.Unmarshal(raw, &line) != nil {
+			continue
+		}
+		for _, fe := range line.Fields {
+			if fe.Name != "" && !seen[fe.Name] {
+				seen[fe.Name] = true
+				fieldNames = append(fieldNames, fe.Name)
+			}
+			if strings.TrimSpace(fe.Language) != "" {
+				usesLanguage = true
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, false, err
+	}
+	return fieldNames, usesLanguage, nil
 }
 
 // hashLine returns a short, stable fingerprint of a manifest line, used

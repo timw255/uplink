@@ -24,7 +24,11 @@ import (
 var version = "dev"
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Default logger for the one-shot subcommands: text on stderr, so
+	// package-level slog.* calls never pollute their stdout (which carries
+	// human output). The daemon overrides this with its configured logger;
+	// the value passed to runDaemon is an unused bootstrap handle.
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	args := os.Args[1:]

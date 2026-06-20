@@ -3,11 +3,43 @@ package aprimo
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+// TestResolveMasterFiles_PartialOnChunkError: a failed search chunk must not
+// sink the whole batch — the other chunks' results still come back (those
+// records skip the per-record GET; the failed chunk's fall back to it).
+func TestResolveMasterFiles_PartialOnChunkError(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError) // first chunk fails
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[{"id":"got","_embedded":{"masterfile":{"id":"mf"}}}]}`))
+	}))
+	defer srv.Close()
+
+	rs := &Records{r: &requester{client: srv.Client(), auth: stubAuth("tok"), baseURL: srv.URL}}
+
+	ids := make([]string, masterFileBatchSize+5) // two chunks
+	for i := range ids {
+		ids[i] = fmt.Sprintf("rec%d", i)
+	}
+	got, err := rs.ResolveMasterFiles(context.Background(), ids)
+	if err == nil {
+		t.Fatal("expected the failed chunk to surface an error")
+	}
+	if got["got"] != "mf" {
+		t.Fatalf("expected the second chunk's result despite the first failing, got %v", got)
+	}
+}
 
 // TestRecordsMasterFile_ParsesID verifies that Records.MasterFile pulls
 // the file id out of the canonical Aprimo HAL response shape, ignoring

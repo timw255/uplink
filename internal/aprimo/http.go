@@ -221,6 +221,17 @@ func (r *requester) do(
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return newTransportError("request cancelled", ctxErr)
 			}
+			// Transport error (conn reset, timeout, DNS/TLS): no response
+			// arrived. Retry idempotent methods with backoff, as for a 5xx.
+			// POST isn't retried — it may have been processed before the drop.
+			if idempotentMethod(method) && attempt < attempts {
+				select {
+				case <-ctx.Done():
+					return newTransportError("request cancelled during retry wait", ctx.Err())
+				case <-time.After(backoffDelay(attempt)):
+				}
+				continue
+			}
 			return newTransportError("transport error", err)
 		}
 
@@ -313,10 +324,18 @@ func shouldRetry(method string, status int) bool {
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
 		http.StatusGatewayTimeout:
-		switch method {
-		case http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodHead:
-			return true
-		}
+		return idempotentMethod(method)
+	}
+	return false
+}
+
+// idempotentMethod reports whether re-sending a method is safe when the
+// response never arrived. GET/PUT/DELETE/HEAD land the same state; a POST
+// might have been processed before the drop, so retrying could duplicate.
+func idempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodHead:
+		return true
 	}
 	return false
 }

@@ -70,6 +70,11 @@ type Config struct {
 	// rate limiting (which is handled by RPS below).
 	MaxConcurrent int
 
+	// catalogUsage, when set, restricts catalog prefetch to the field types
+	// a run references. Injected programmatically by the import command
+	// (see cmd/uplink/import.go), never set from YAML. nil → fetch all.
+	catalogUsage *catalogUsage
+
 	// RPS is the sustained per-second request budget the SDK paces
 	// itself against. Set to your tenant's licensed Aprimo RPS (the
 	// default Aprimo allowance is on the order of 15; higher values
@@ -147,6 +152,17 @@ func loadConfig(name string, raw map[string]any) (*Config, error) {
 		cfg.RPS = float64(v)
 	} else if v, ok := raw["rps"].(float64); ok {
 		cfg.RPS = v
+	}
+
+	// Programmatic catalog-usage hint (import command only). Restricts which
+	// catalogs Init prefetches to the field types the manifest references.
+	if names, ok := raw["_catalog_field_names"].([]string); ok {
+		usage := &catalogUsage{fieldNames: make(map[string]bool, len(names))}
+		for _, n := range names {
+			usage.fieldNames[canonicalFieldName(n)] = true
+		}
+		usage.usesLanguage, _ = raw["_catalog_uses_language"].(bool)
+		cfg.catalogUsage = usage
 	}
 
 	// Resolve env-var indirections, *Env wins over inline.

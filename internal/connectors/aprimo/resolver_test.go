@@ -64,6 +64,58 @@ func newTestResolver() *resolver {
 	}
 }
 
+// TestNeededCatalogs covers the catalog-selection logic: an import fetches
+// only the catalogs whose field types it uses; the daemon (nil usage) fetches
+// all; languages is pulled for a language tag or a configured default.
+func TestNeededCatalogs(t *testing.T) {
+	fields := map[string]fieldRef{
+		"caption": {DataType: aprimo.DataTypeSingleLineText},
+		"owner":   {DataType: aprimo.DataTypeUserList},
+		"team":    {DataType: aprimo.DataTypeUserGroupList},
+		"topics":  {DataType: aprimo.DataTypeClassificationList},
+		"ui lang": {DataType: aprimo.DataTypeLanguageList},
+	}
+	use := func(names ...string) *catalogUsage {
+		u := &catalogUsage{fieldNames: map[string]bool{}}
+		for _, n := range names {
+			u.fieldNames[n] = true
+		}
+		return u
+	}
+
+	cases := []struct {
+		name       string
+		usage      *catalogUsage
+		defaultLng string
+		want       catalogNeeds
+	}{
+		{"daemon fetches all", nil, "", catalogNeeds{true, true, true, true}},
+		{"text-only fetches none", use("caption"), "", catalogNeeds{}},
+		{"user field pulls users only", use("caption", "owner"), "", catalogNeeds{users: true}},
+		{"group field pulls groups", use("team"), "", catalogNeeds{groups: true}},
+		{"classification field pulls classifications", use("topics"), "", catalogNeeds{classifications: true}},
+		{"language-list field pulls languages", use("ui lang"), "", catalogNeeds{languages: true}},
+		{"default language pulls languages", use("caption"), "en-US", catalogNeeds{languages: true}},
+		{"unknown field name pulls nothing", use("nonexistent"), "", catalogNeeds{}},
+		{"all types", use("owner", "team", "topics", "ui lang"), "", catalogNeeds{true, true, true, true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := neededCatalogs(fields, tc.usage, tc.defaultLng); got != tc.want {
+				t.Fatalf("neededCatalogs = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// language usage flag pulls languages even with no language-typed field.
+func TestNeededCatalogs_LanguageTag(t *testing.T) {
+	got := neededCatalogs(map[string]fieldRef{}, &catalogUsage{usesLanguage: true}, "")
+	if !got.languages {
+		t.Fatal("a language tag in the manifest must pull the languages catalog")
+	}
+}
+
 // --- scalar types ---
 
 func TestResolver_TextScalar(t *testing.T) {

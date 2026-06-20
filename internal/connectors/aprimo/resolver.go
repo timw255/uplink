@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/timw255/uplink/internal/aprimo"
 )
@@ -53,49 +54,132 @@ type fieldRef struct {
 	DataType string
 }
 
-// buildResolver fetches all catalogs from Aprimo and constructs an
-// in-memory resolver. Called from Connector.Init AND periodically
-// from the background refresher.
-func buildResolver(ctx context.Context, api *aprimo.Client, defaultLanguage string) (*resolver, error) {
+// catalogUsage restricts which catalogs buildResolver fetches to those a run
+// actually references. nil means fetch every catalog — the daemon, which
+// can't predict its future events. An import builds one from its manifest.
+type catalogUsage struct {
+	fieldNames   map[string]bool // canonicalized field names the run references
+	usesLanguage bool            // any field entry specifies a language
+}
+
+// catalogNeeds is which heavy catalogs a run must prefetch.
+type catalogNeeds struct {
+	classifications bool
+	users           bool
+	groups          bool
+	languages       bool
+}
+
+// neededCatalogs decides which heavy catalogs to fetch given the field
+// definitions (name→type) and the run's usage. nil usage (the daemon) needs
+// all of them. An import needs only the catalogs whose field types appear in
+// its manifest; languages is also needed for any language tag or a configured
+// default language.
+func neededCatalogs(fieldsByName map[string]fieldRef, usage *catalogUsage, defaultLanguage string) catalogNeeds {
+	if usage == nil {
+		return catalogNeeds{true, true, true, true}
+	}
+	need := catalogNeeds{languages: defaultLanguage != "" || usage.usesLanguage}
+	for name := range usage.fieldNames {
+		switch fieldsByName[name].DataType {
+		case aprimo.DataTypeClassificationList:
+			need.classifications = true
+		case aprimo.DataTypeUserList:
+			need.users = true
+		case aprimo.DataTypeUserGroupList:
+			need.groups = true
+		case aprimo.DataTypeLanguageList:
+			need.languages = true
+		}
+	}
+	return need
+}
+
+// buildResolver fetches the Aprimo catalogs and constructs an in-memory
+// resolver. Field definitions are always fetched (they map field names to
+// types and carry OptionList items inline); the heavier classification /
+// user / user-group / language catalogs are fetched only when usage shows a
+// field of the matching type is in play. Called from Connector.Init and the
+// background refresher (which passes nil usage — the daemon fetches all).
+func buildResolver(ctx context.Context, api *aprimo.Client, defaultLanguage string, usage *catalogUsage) (*resolver, error) {
+	r := &resolver{
+		fieldsByName:          map[string]fieldRef{},
+		languagesByCulture:    map[string]string{},
+		languagesByName:       map[string]string{},
+		classificationsByPath: map[string]string{},
+		optionItemsByField:    map[string]map[string]string{},
+		usersByKey:            map[string]string{},
+		userGroupsByName:      map[string]string{},
+	}
+
 	fields, err := api.FieldDefinitions.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("prefetch field definitions: %w", err)
 	}
-	langs, err := api.Languages.List(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("prefetch languages: %w", err)
-	}
-	classifications, err := api.Classifications.List(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("prefetch classifications: %w", err)
-	}
-	users, err := api.Users.List(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("prefetch users: %w", err)
-	}
-	groups, err := api.UserGroups.List(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("prefetch user groups: %w", err)
-	}
-
-	r := &resolver{
-		fieldsByName:          make(map[string]fieldRef, len(fields)),
-		languagesByCulture:    make(map[string]string, len(langs)),
-		languagesByName:       make(map[string]string, len(langs)),
-		classificationsByPath: make(map[string]string, len(classifications)),
-		optionItemsByField:    make(map[string]map[string]string),
-		usersByKey:            make(map[string]string, len(users)*2),
-		userGroupsByName:      make(map[string]string, len(groups)),
-	}
-
 	for _, f := range fields {
-		key := canonicalFieldName(f.Name)
-		if key == "" {
-			continue
-		}
 		// Last write wins on duplicate names (Aprimo permits duplicate
 		// display names; scripts can't disambiguate either).
-		r.fieldsByName[key] = fieldRef{ID: f.ID, DataType: f.DataType}
+		if key := canonicalFieldName(f.Name); key != "" {
+			r.fieldsByName[key] = fieldRef{ID: f.ID, DataType: f.DataType}
+		}
+		// OptionList items come back inline on the field listing — no
+		// per-field GetByID.
+		if f.DataType == aprimo.DataTypeOptionList {
+			items := make(map[string]string, len(f.OptionListItems))
+			for _, it := range f.OptionListItems {
+				if n := strings.ToLower(strings.TrimSpace(it.Name)); n != "" {
+					items[n] = it.ID
+				}
+			}
+			r.optionItemsByField[f.ID] = items
+		}
+	}
+
+	// Which heavy catalogs does this run need? The daemon (nil usage) needs
+	// all of them; an import needs only those whose field types it uses.
+	need := neededCatalogs(r.fieldsByName, usage, defaultLanguage)
+
+	// Fetch the needed catalogs concurrently; first error cancels the rest.
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		langs           []aprimo.Language
+		classifications []aprimo.Classification
+		users           []aprimo.User
+		groups          []aprimo.UserGroup
+	)
+	type catalogFetch struct {
+		name string
+		run  func() error
+	}
+	var fetch []catalogFetch
+	if need.languages {
+		fetch = append(fetch, catalogFetch{"languages", func() (e error) { langs, e = api.Languages.List(fetchCtx); return }})
+	}
+	if need.classifications {
+		fetch = append(fetch, catalogFetch{"classifications", func() (e error) { classifications, e = api.Classifications.List(fetchCtx); return }})
+	}
+	if need.users {
+		fetch = append(fetch, catalogFetch{"users", func() (e error) { users, e = api.Users.List(fetchCtx); return }})
+	}
+	if need.groups {
+		fetch = append(fetch, catalogFetch{"user groups", func() (e error) { groups, e = api.UserGroups.List(fetchCtx); return }})
+	}
+	errs := make([]error, len(fetch))
+	var wg sync.WaitGroup
+	for i, f := range fetch {
+		wg.Go(func() {
+			if err := f.run(); err != nil {
+				errs[i] = fmt.Errorf("prefetch %s: %w", f.name, err)
+				cancel()
+			}
+		})
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	for _, l := range langs {
@@ -106,14 +190,11 @@ func buildResolver(ctx context.Context, api *aprimo.Client, defaultLanguage stri
 			r.languagesByName[n] = l.ID
 		}
 	}
-
 	for _, c := range classifications {
-		if c.NamePath == "" {
-			continue
+		if c.NamePath != "" {
+			r.classificationsByPath[canonicalPath(c.NamePath)] = c.ID
 		}
-		r.classificationsByPath[canonicalPath(c.NamePath)] = c.ID
 	}
-
 	for _, u := range users {
 		if e := strings.ToLower(strings.TrimSpace(u.Email)); e != "" {
 			r.usersByKey[e] = u.ID
@@ -126,21 +207,6 @@ func buildResolver(ctx context.Context, api *aprimo.Client, defaultLanguage stri
 		if n := strings.ToLower(strings.TrimSpace(g.Name)); n != "" {
 			r.userGroupsByName[n] = g.ID
 		}
-	}
-
-	// OptionList items come back inline on the field listing, so build the
-	// name→id maps straight from it — no per-field GetByID.
-	for _, f := range fields {
-		if f.DataType != aprimo.DataTypeOptionList {
-			continue
-		}
-		items := make(map[string]string, len(f.OptionListItems))
-		for _, it := range f.OptionListItems {
-			if n := strings.ToLower(strings.TrimSpace(it.Name)); n != "" {
-				items[n] = it.ID
-			}
-		}
-		r.optionItemsByField[f.ID] = items
 	}
 
 	if defaultLanguage != "" {
@@ -190,8 +256,7 @@ func (r *resolver) resolveFieldEntries(entries []any) ([]map[string]any, error) 
 
 		ref, ok := r.fieldsByName[canonicalFieldName(name)]
 		if !ok {
-			return nil, fmt.Errorf("entry[%d] (%q): no Aprimo field definition matches this name "+
-				"(check the field's display name in Aprimo, or wait for the next refresh_interval / restart the daemon)", i, name)
+			return nil, fmt.Errorf("entry[%d] (%q): no field with this name in Aprimo (check the display name)", i, name)
 		}
 
 		langID, err := r.resolveLanguage(entry["language"], name, i)
@@ -538,7 +603,7 @@ func (r *resolver) resolveLanguage(raw any, entryName string, entryIdx int) (str
 	}
 	id, ok := r.languagesByCulture[strings.ToLower(culture)]
 	if !ok {
-		return "", fmt.Errorf("entry[%d] (%q): unknown language culture %q (configure it in Aprimo's Admin → Languages and restart the daemon)", entryIdx, entryName, culture)
+		return "", fmt.Errorf("entry[%d] (%q): unknown language %q (use an IETF culture tag like \"en-US\")", entryIdx, entryName, culture)
 	}
 	return id, nil
 }

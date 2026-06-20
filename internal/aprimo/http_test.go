@@ -217,6 +217,48 @@ func TestRequester_DoesNotRetryPostOn5xx(t *testing.T) {
 	}
 }
 
+// TestRequester_RetriesTransportErrorForIdempotent: a dropped connection
+// (no response) on a GET is retried, the same as a 5xx.
+func TestRequester_RetriesTransportErrorForIdempotent(t *testing.T) {
+	var calls atomic.Int32
+	r, _ := newTestRequester(t, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) < 2 {
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			_ = conn.Close() // drop the connection — client sees a transport error
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}, nil)
+	r.maxRetries = 3
+
+	if err := r.getJSON(context.Background(), "/x", nil, &map[string]any{}); err != nil {
+		t.Fatalf("getJSON: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected 2 calls (1 retry after the dropped connection), got %d", got)
+	}
+}
+
+// TestRequester_DoesNotRetryPostOnTransportError: a POST that may already
+// have been processed must not be re-sent on a dropped connection.
+func TestRequester_DoesNotRetryPostOnTransportError(t *testing.T) {
+	var calls atomic.Int32
+	r, _ := newTestRequester(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		_ = conn.Close()
+	}, nil)
+	r.maxRetries = 3
+
+	if err := r.postJSON(context.Background(), "/x", map[string]string{"k": "v"}, &map[string]any{}, nil); err == nil {
+		t.Fatal("expected a transport error from the dropped POST")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 call (no POST retry on transport error), got %d", got)
+	}
+}
+
 // TestBackoffDelay_AppliesJitter samples backoffDelay enough times to
 // expose lockstep behavior. With no jitter, two callers at the same
 // attempt number would get identical delays and retry in unison.

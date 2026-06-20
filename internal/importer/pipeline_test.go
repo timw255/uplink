@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -177,6 +178,77 @@ func TestImportResumeFilesUnfiledRecords(t *testing.T) {
 	got := dest.filedIDs()
 	if len(got) != 2 || !slices.Contains(got, "rec-a") || !slices.Contains(got, "rec-b") {
 		t.Fatalf("filed on resume = %v, want [rec-a rec-b]", got)
+	}
+}
+
+// TestFilingFailureLeavesRecordsUnfiled: a failed filing batch must not be
+// marked filed, so a resume re-files it — the record exists either way.
+func TestFilingFailureLeavesRecordsUnfiled(t *testing.T) {
+	manifest := writeManifest(t, `{"file":"a.jpg","fields":[{"name":"T","value":"x"}]}`)
+	dest := &fakeDest{collection: "coll-1", fileErr: errors.New("transient 503")}
+	src := &fakeSource{files: map[string]int64{"a.jpg": 10}}
+	ledgerPath := filepath.Join(t.TempDir(), "led.jsonl")
+
+	sum := runImporter(t, Options{ManifestPath: manifest, Dest: dest, Source: src, ResultsPath: ledgerPath})
+	if sum.Created != 1 {
+		t.Fatalf("created = %d, want 1 (the record is created even if filing fails)", sum.Created)
+	}
+	// The summary surfaces the shortfall so the operator sees it (and the
+	// command exits non-zero), not just a stderr warning.
+	if sum.Unfiled != 1 {
+		t.Fatalf("Summary.Unfiled = %d, want 1 (filing failed)", sum.Unfiled)
+	}
+	st, err := loadLedgerState(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.unfiled) != 1 {
+		t.Fatalf("unfiled = %v, want 1 (filing failed → no marker → resume re-files)", st.unfiled)
+	}
+}
+
+// TestDryRunDoesNotFileCollection: a dry run must not write to Aprimo, even
+// when a resume ledger has created-but-unfiled records that a real run would
+// file. Guards the DryRun check on the filing path.
+func TestDryRunDoesNotFileCollection(t *testing.T) {
+	line := `{"file":"a.jpg","fields":[{"name":"T","value":"x"}]}`
+	manifest := writeManifest(t, line)
+	ledgerPath := seedLedger(t,
+		Result{Line: 1, Hash: hashLine([]byte(line)), Action: string(ActionCreated), DestID: "rec-a"},
+	)
+	dest := &fakeDest{collection: "coll-1"}
+	src := &fakeSource{files: map[string]int64{"a.jpg": 10}}
+
+	runImporter(t, Options{
+		ManifestPath: manifest, Dest: dest, Source: src,
+		ResultsPath: ledgerPath, Resume: true, DryRun: true,
+	})
+	if got := dest.filedIDs(); len(got) != 0 {
+		t.Fatalf("dry run must not file into the collection, but filed %v", got)
+	}
+}
+
+// TestScanFieldUsage: collects the distinct field names and flags language
+// use, tolerating blank and malformed lines.
+func TestScanFieldUsage(t *testing.T) {
+	manifest := writeManifest(t,
+		`{"file":"a.jpg","fields":[{"name":"Caption","value":"x"},{"name":"Owner","value":"tim"}]}`,
+		``,                // blank
+		`{not valid json`, // malformed — tolerated
+		`{"file":"b.jpg","fields":[{"name":"Caption","value":"y","language":"fr-FR"}]}`,
+	)
+	names, usesLang, err := ScanFieldUsage(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usesLang {
+		t.Fatal("usesLanguage = false, want true (b.jpg has a language)")
+	}
+	if !slices.Contains(names, "Caption") || !slices.Contains(names, "Owner") {
+		t.Fatalf("names = %v, want Caption and Owner", names)
+	}
+	if len(names) != 2 {
+		t.Fatalf("names = %v, want exactly 2 distinct (Caption deduped)", names)
 	}
 }
 

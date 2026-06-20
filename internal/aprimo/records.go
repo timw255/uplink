@@ -237,6 +237,7 @@ type searchRecordsResult struct {
 // skipped so a stray value can't malform the expression.
 func (rs *Records) ResolveMasterFiles(ctx context.Context, recordIDs []string) (map[string]string, error) {
 	out := make(map[string]string, len(recordIDs))
+	var firstErr error
 	for chunk := range slices.Chunk(recordIDs, masterFileBatchSize) {
 		clauses := make([]string, 0, len(chunk))
 		for _, id := range chunk {
@@ -253,7 +254,16 @@ func (rs *Records) ResolveMasterFiles(ctx context.Context, recordIDs []string) (
 		path := fmt.Sprintf("/api/core/search/records?page=1&pageSize=%d", len(clauses))
 		var resp searchRecordsResult
 		if err := rs.r.postJSON(ctx, path, body, &resp, map[string]string{"select-Record": "masterfile"}); err != nil {
-			return nil, err
+			// A failed chunk leaves its records out of the map; they fall back
+			// to the per-record GET. Continue with the rest; stop only if the
+			// run is cancelled.
+			if firstErr == nil {
+				firstErr = err
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
 		for _, it := range resp.Items {
 			if it.ID != "" && it.Embedded.MasterFile.ID != "" {
@@ -261,7 +271,7 @@ func (rs *Records) ResolveMasterFiles(ctx context.Context, recordIDs []string) (
 			}
 		}
 	}
-	return out, nil
+	return out, firstErr
 }
 
 // isRecordID reports whether s is a bare alphanumeric token (the shape of an

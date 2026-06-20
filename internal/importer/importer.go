@@ -174,8 +174,30 @@ type Summary struct {
 	// stopped early (--stop-on-error tripped, or an interrupt). These are
 	// not failures — they were never attempted, and a resume retries them.
 	Aborted int
-	Elapsed time.Duration
+	// Filed is how many records were filed into the default collection this
+	// run (0 when no default collection is configured).
+	Filed int
+	// Unfiled is how many created records still need filing into the default
+	// collection because a filing batch failed (the records exist; a re-run
+	// finishes them). 0 on a clean run.
+	Unfiled int
+	// Problems holds the first maxProblems failed/invalid records (line +
+	// reason) so the caller can show what needs fixing without re-reading the
+	// ledger. Invalid/Failed carry the true totals.
+	Problems []Problem
+	Elapsed  time.Duration
 }
+
+// Problem is one record that failed validation or import, for display.
+type Problem struct {
+	Line   int
+	Reason string
+}
+
+// maxProblems caps how many problem details a Summary carries — enough to
+// act on, without holding tens of thousands of strings for a wholly broken
+// manifest. The Invalid/Failed counts still reflect the true totals.
+const maxProblems = 100
 
 func (s *Summary) add(r Result) {
 	// "uploaded" and "filed" are intermediate/marker ledger rows, not
@@ -273,8 +295,11 @@ func (im *Importer) resolveMasterFiles(ctx context.Context, passed []workRecord)
 	}
 	m, err := r.ResolveMasterFiles(ctx, ids)
 	if err != nil {
-		im.logger.Warn("batch master-file resolve failed; using per-record lookup", "err", err)
-		return nil
+		// Use the partial result: resolved records skip the per-record GET,
+		// the rest fall back to it.
+		im.logger.Warn("some master-file batches failed; those records use per-record lookup",
+			"err", err, "resolved", len(m), "update_records", len(ids))
+		return m
 	}
 	im.logger.Info("resolved master files up front", "update_records", len(ids), "resolved", len(m))
 	return m
@@ -285,24 +310,41 @@ func (im *Importer) resolveMasterFiles(ctx context.Context, passed []workRecord)
 // skips it. Chunked at the SDK's batch size so each chunk is exactly one
 // API call and one marker. Filing failures are logged, not fatal: the
 // records exist, and a resume re-files whatever has no marker (idempotent).
-func (im *Importer) fileCreatedRecords(ctx context.Context, filer collectionFiler, l *ledger, ids []string) {
+func (im *Importer) fileCreatedRecords(ctx context.Context, filer collectionFiler, l *ledger, ids []string) int {
 	if len(ids) == 0 {
-		return
+		return 0
 	}
 	im.logger.Info("filing records into collection", "records", len(ids), "collection", filer.DefaultCollection())
-	filed := 0
+	// A brief, visible note for the post-upload phase on an interactive run —
+	// otherwise a big batch looks like a hang between the last upload and the
+	// summary. Cleared before the caller prints the summary.
+	if w := im.opts.StatusWriter; w != nil {
+		fmt.Fprintf(w, "\rfinishing up — filing %d records into the collection…", len(ids))
+		defer fmt.Fprint(w, "\r\033[K")
+	}
+	filed, failed := 0, 0
 	for chunk := range slices.Chunk(ids, aprimo.CollectionBatchSize) {
 		if err := filer.AddRecordsToCollection(ctx, chunk); err != nil {
-			im.logger.Warn("collection filing batch failed; resume will retry the rest",
-				"err", err, "filed", filed, "unfiled", len(ids)-filed)
-			return
+			if ctx.Err() != nil {
+				break // run winding down — resume re-files the rest
+			}
+			// Failed batch: skip it (no marker → resume re-files it) and keep
+			// filing the others.
+			im.logger.Warn("collection filing batch failed; resume will re-file it", "err", err)
+			failed += len(chunk)
+			continue
 		}
 		if werr := l.write(Result{Action: string(ActionFiled), Filed: chunk}); werr != nil {
 			im.logger.Warn("ledger write (filed marker) failed", "err", werr)
 		}
 		filed += len(chunk)
 	}
-	im.logger.Info("collection filing complete", "filed", filed)
+	if failed > 0 || ctx.Err() != nil {
+		im.logger.Warn("collection filing incomplete; resume will finish it", "filed", filed, "unfiled", len(ids)-filed)
+	} else {
+		im.logger.Info("collection filing complete", "filed", filed)
+	}
+	return filed
 }
 
 // Run loads the manifest, validates + stats every record up front, then
@@ -328,9 +370,10 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 
 	// Collection filing: when the destination files into a default
 	// collection, batch it (suppress the connector's per-record filing) and
-	// track it in the ledger instead of one rate-limited call per record.
+	// track it in the ledger instead of one rate-limited call per record. A
+	// dry run never files — it must not write to Aprimo.
 	filer, filing := im.opts.Dest.(collectionFiler)
-	filing = filing && filer.DefaultCollection() != ""
+	filing = filing && filer.DefaultCollection() != "" && !im.opts.DryRun
 	var createdIDs []string // record ids created this run, to file in batches
 
 	ledger, err := newLedger(im.opts.ResultsPath, im.opts.Resume)
@@ -380,6 +423,9 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 			}
 			sumMu.Lock()
 			summary.add(r)
+			if (r.Action == "invalid" || r.Action == "error") && len(summary.Problems) < maxProblems {
+				summary.Problems = append(summary.Problems, Problem{Line: r.Line, Reason: r.Err})
+			}
 			sumMu.Unlock()
 			im.logResult(r)
 			if r.Action == "error" && im.opts.StopOnError {
@@ -430,9 +476,12 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 
 	// File all created records into the default collection in batches, now
 	// that the drainer has the full set. Prepend any records left unfiled by
-	// a prior run (resume). Re-filing is idempotent, so a crash here is safe.
-	if filing {
-		im.fileCreatedRecords(runCtx, filer, ledger, append(resume.unfiled, createdIDs...))
+	// a prior run (resume). Skip on an aborted run (the cancelled context
+	// would just fail every batch) — resume re-files them; idempotent.
+	if filing && runCtx.Err() == nil {
+		toFile := append(resume.unfiled, createdIDs...)
+		summary.Filed = im.fileCreatedRecords(runCtx, filer, ledger, toFile)
+		summary.Unfiled = len(toFile) - summary.Filed
 	}
 
 	// Records that parsed but never produced a result were abandoned when
@@ -496,7 +545,9 @@ func (im *Importer) logResult(r Result) {
 	}
 	switch r.Action {
 	case "error", "invalid":
-		im.logger.Warn("import record failed", "line", r.Line, "err", r.Err)
+		// Per-record detail is carried in Summary.Problems and shown by the
+		// caller; keep the log at debug so it doesn't double up on a TTY.
+		im.logger.Debug("import record failed", "line", r.Line, "err", r.Err)
 	default:
 		im.logger.Debug("import record ok", "line", r.Line, "action", r.Action, "dest_id", r.DestID)
 	}

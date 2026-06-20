@@ -332,6 +332,16 @@ func TestDryRunValidatesWithoutWriting(t *testing.T) {
 	if uploads, creates, metas := dest.counts(); uploads != 0 || creates != 0 || metas != 0 {
 		t.Fatalf("dry-run must not write: uploads=%d creates=%d metas=%d", uploads, creates, metas)
 	}
+	// Each invalid record is captured (line + reason) so the caller can show
+	// what to fix without re-reading anything.
+	if len(sum.Problems) != 3 {
+		t.Fatalf("Problems = %d, want 3 (one per invalid record)", len(sum.Problems))
+	}
+	for _, p := range sum.Problems {
+		if p.Line == 0 || p.Reason == "" {
+			t.Fatalf("problem missing line or reason: %+v", p)
+		}
+	}
 }
 
 func TestDryRunFlagsRewrittenFilenames(t *testing.T) {

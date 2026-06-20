@@ -7,12 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/mattn/go-isatty"
 	"github.com/timw255/uplink/internal/channel"
@@ -54,7 +54,18 @@ func runImport(args []string, stdout io.Writer) error {
 	} else {
 		return fmt.Errorf("--log-level %q must be one of debug, info, warn, error", *logLevel)
 	}
+	// On an interactive terminal the pretty UI carries the narration, so keep
+	// the (stderr) log to warnings and errors unless the operator asked for
+	// more. Piped/CI runs keep the structured info log.
+	if level == "info" && ttyWriter(stdout) != nil {
+		level = "warn"
+	}
 	logger := buildLogger(level, "text")
+	// Redirect the process-global default (set to JSON-on-stdout in main for
+	// the daemon) to this stderr text logger. Package-level slog.* calls in the
+	// connector/SDK use the default; without this they would print JSON into
+	// the middle of the pretty stdout UI. Matches runDaemon.
+	slog.SetDefault(logger)
 
 	resolved, err := resolveConfigPath(*configPath)
 	if err != nil {
@@ -116,17 +127,40 @@ func runImport(args []string, stdout io.Writer) error {
 	// daemon's periodic catalog refresh (shared code path); pin it off here.
 	if destSpec.Config != nil {
 		destSpec.Config["refresh_interval"] = "0"
+
+		// Tell the connector which catalogs to prefetch: scan the manifest
+		// for the field names (and language use) it references, so Init pulls
+		// only the user/group/classification/language catalogs whose field
+		// types actually appear. A scan error is non-fatal — the connector
+		// then falls back to fetching every catalog.
+		if names, usesLang, scanErr := importer.ScanFieldUsage(*manifestPath); scanErr == nil {
+			destSpec.Config["_catalog_field_names"] = names
+			destSpec.Config["_catalog_uses_language"] = usesLang
+		} else {
+			logger.Warn("manifest field scan failed; prefetching all catalogs", "err", scanErr)
+		}
 	}
+	mode := "import"
+	if *dryRun {
+		mode = "dry run"
+	}
+	ui := newImportUI(stdout)
+	ui.banner(mode)
+
 	var noStore *store.Store
-	logger.Info("connecting", "destination", dest)
+	ui.step("Connecting to %s", dest)
 	if err := pool.Build(ctx, destSpec.Name, destSpec.Type, destSpec.Config, noStore); err != nil {
+		ui.failed()
 		return err
 	}
+	ui.ok()
 	if *sourceName != "" {
-		logger.Info("connecting", "source", *sourceName)
+		ui.step("Reading source %s", *sourceName)
 		if err := pool.Build(ctx, srcSpec.Name, srcSpec.Type, srcSpec.Config, noStore); err != nil {
+			ui.failed()
 			return err
 		}
+		ui.ok()
 	}
 
 	destConn, _ := pool.Get(dest)
@@ -149,7 +183,11 @@ func runImport(args []string, stdout io.Writer) error {
 		return err
 	}
 	if ledgerPath != "" {
-		logger.Info("ledger", "path", ledgerPath, "resume", resume)
+		logger.Debug("ledger", "path", ledgerPath, "resume", resume)
+	}
+	ui.note("Manifest", filepath.Base(*manifestPath), "")
+	if resume {
+		ui.note("Resuming", "previous run", "already-done records are skipped")
 	}
 
 	im, err := importer.New(importer.Options{
@@ -172,18 +210,17 @@ func runImport(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	mode := "import"
-	if *dryRun {
-		mode = "dry-run"
+	logger.Debug("starting", "mode", mode, "manifest", *manifestPath)
+	if ui.tty {
+		fmt.Fprintln(stdout) // separate the pre-flight steps from the live line
 	}
-	logger.Info("starting", "mode", mode, "manifest", *manifestPath)
 
 	sum, err := im.Run(ctx)
 	if err != nil {
 		return err
 	}
 
-	printImportSummary(stdout, sum, *dryRun)
+	ui.summary(sum, *dryRun)
 
 	// Non-zero exit when anything didn't pass, so the command composes in
 	// scripts and CI.
@@ -196,41 +233,10 @@ func runImport(args []string, stdout io.Writer) error {
 	if !*dryRun && sum.Failed > 0 {
 		return fmt.Errorf("%d of %d record(s) failed to import", sum.Failed, sum.Total)
 	}
+	if !*dryRun && sum.Unfiled > 0 {
+		return fmt.Errorf("%d record(s) imported but not filed into the collection — rerun to finish", sum.Unfiled)
+	}
 	return nil
-}
-
-// printImportSummary writes a human-readable tally to stdout.
-func printImportSummary(w io.Writer, s importer.Summary, dryRun bool) {
-	fmt.Fprintln(w)
-	if dryRun {
-		fmt.Fprintf(w, "Dry run complete in %s\n", s.Elapsed.Round(time.Millisecond))
-		fmt.Fprintf(w, "  records:  %d\n", s.Total)
-		fmt.Fprintf(w, "  valid:    %d\n", s.Valid)
-		fmt.Fprintf(w, "  invalid:  %d\n", s.Invalid)
-		if s.Rewritten > 0 {
-			fmt.Fprintf(w, "  filenames to be rewritten: %d (see warnings in the log)\n", s.Rewritten)
-		}
-		if s.Skipped > 0 {
-			fmt.Fprintf(w, "  skipped:  %d\n", s.Skipped)
-		}
-		return
-	}
-	headline := "Import complete in"
-	if s.Aborted > 0 {
-		headline = "Import stopped after"
-	}
-	fmt.Fprintf(w, "%s %s\n", headline, s.Elapsed.Round(time.Millisecond))
-	fmt.Fprintf(w, "  records:  %d\n", s.Total)
-	fmt.Fprintf(w, "  created:  %d\n", s.Created)
-	fmt.Fprintf(w, "  updated:  %d\n", s.Updated)
-	fmt.Fprintf(w, "  metadata: %d\n", s.Metadata)
-	if s.Skipped > 0 {
-		fmt.Fprintf(w, "  skipped:  %d\n", s.Skipped)
-	}
-	fmt.Fprintf(w, "  failed:   %d\n", s.Failed)
-	if s.Aborted > 0 {
-		fmt.Fprintf(w, "  not processed: %d (run stopped early — rerun to resume)\n", s.Aborted)
-	}
 }
 
 // resolveLedger decides where per-record outcomes are tracked and

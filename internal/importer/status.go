@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/timw255/uplink/internal/adaptive"
+	"github.com/timw255/uplink/internal/tui"
 )
 
 // runReporter renders progress until reportStop is closed. On a TTY it
@@ -38,9 +39,10 @@ func (im *Importer) runReporter(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	style := tui.New(im.opts.StatusWriter) // enabled iff StatusWriter is a TTY
+
 	const smoothing = 0.3
 	var (
-		prevLen          int
 		lastReq, lastByt int64
 		lastT            = start
 		emaRPS, emaMBps  float64
@@ -81,13 +83,10 @@ func (im *Importer) runReporter(
 		}
 
 		if tty {
-			line := progressLine(im.opts.DryRun, snap, total, emaRPS, emaMBps, inFlight, elapsed)
-			pad := ""
-			if prevLen > len(line) {
-				pad = strings.Repeat(" ", prevLen-len(line))
-			}
-			fmt.Fprintf(im.opts.StatusWriter, "\r%s%s", line, pad)
-			prevLen = len(line)
+			line := progressLine(style, im.opts.DryRun, snap, total, emaRPS, emaMBps, inFlight, elapsed)
+			// \r returns to column 0; \033[K erases to end of line — robust to
+			// the ANSI color codes in the line (a byte-length pad is not).
+			fmt.Fprintf(im.opts.StatusWriter, "\r\033[K%s", line)
 			if final {
 				fmt.Fprintln(im.opts.StatusWriter)
 			}
@@ -107,30 +106,46 @@ func (im *Importer) runReporter(
 	}
 }
 
-// progressLine is the single live status line. Real runs show the two
-// gauges that matter — create throughput (rps) and the upload pipe (in-
-// flight count + MB/s); dry runs show validity counts.
-func progressLine(dryRun bool, s Summary, total int, rps, mbps float64, inFlight int, elapsed time.Duration) string {
+// progressLine is the single live status line. Real runs show a progress bar
+// plus the two gauges that matter — create throughput (req/s) and the upload
+// pipe (in-flight count + MB/s); dry runs show validity counts. The styler is
+// always color-enabled here (the line is only rendered to a TTY).
+func progressLine(st *tui.Styler, dryRun bool, s Summary, total int, rps, mbps float64, inFlight int, elapsed time.Duration) string {
+	sep := "  " + st.Dim("·") + "  "
 	var b strings.Builder
+
 	if dryRun {
-		b.WriteString("validating  ")
-		writeCount(&b, s.Total, total)
-		fmt.Fprintf(&b, "   ok %d   invalid %d   %s", s.Valid, s.Invalid, elapsed.Round(time.Second))
+		b.WriteString(st.Brand("validating") + "  ")
+		b.WriteString(progressBar(st, s.Total, total))
+		b.WriteString(sep + "valid " + tui.Commas(s.Valid))
+		b.WriteString(sep + "invalid " + tui.Commas(s.Invalid))
+		b.WriteString(sep + st.Dim(elapsed.Round(time.Second).String()))
 		return b.String()
 	}
-	b.WriteString("importing  ")
-	writeCount(&b, s.Total, total)
-	fmt.Fprintf(&b, "   rps %.0f   up %d   %.0f MB/s   fail %d   %s",
-		rps, inFlight, mbps, s.Failed, elapsed.Round(time.Second))
+
+	b.WriteString(st.Brand("importing") + "  ")
+	b.WriteString(progressBar(st, s.Total, total))
+	b.WriteString(sep + tui.Commas(int(rps+0.5)) + st.Dim("/s"))
+	b.WriteString(sep + st.Dim("↑") + fmt.Sprintf("%d ", inFlight) + st.Dim(fmt.Sprintf("%.0f MB/s", mbps)))
+	if s.Failed > 0 {
+		b.WriteString(sep + tui.Commas(s.Failed) + " failed")
+	}
+	b.WriteString(sep + st.Dim(elapsed.Round(time.Second).String()))
 	return b.String()
 }
 
-func writeCount(b *strings.Builder, processed, total int) {
-	if total > 0 {
-		fmt.Fprintf(b, "%d/%d (%d%%)", processed, total, processed*100/total)
-	} else {
-		fmt.Fprintf(b, "%d", processed)
+// progressBar renders "███████░░░░  68%  7,240/12,480", or just a running
+// count when the total isn't known.
+func progressBar(st *tui.Styler, done, total int) string {
+	if total <= 0 {
+		return st.Bold(tui.Commas(done))
 	}
+	const width = 16
+	filled := min(done*width/total, width)
+	bar := st.Brand(strings.Repeat("█", filled)) + st.Dim(strings.Repeat("░", width-filled))
+	return fmt.Sprintf("%s  %s  %s", bar,
+		st.Bold(fmt.Sprintf("%3d%%", done*100/total)),
+		st.Dim(tui.Commas(done)+"/"+tui.Commas(total)))
 }
 
 // progressArgs is the structured-log equivalent of progressLine.

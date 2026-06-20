@@ -3,16 +3,22 @@ package importer
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/timw255/uplink/internal/tui"
 )
+
+// plainStyler is a color-disabled styler (io.Discard isn't a TTY), so the
+// format tests assert on plain text without ANSI codes.
+func plainStyler() *tui.Styler { return tui.New(io.Discard) }
 
 func TestProgressLineFormat(t *testing.T) {
 	s := Summary{Total: 36, Created: 30, Metadata: 2, Failed: 4}
-	// progressLine(dryRun, summary, total, rps, mbps, inFlight, elapsed)
-	line := progressLine(false, s, 100, 14, 312, 8, 45*time.Second)
-	for _, want := range []string{"importing", "36/100", "(36%)", "rps 14", "up 8", "312 MB/s", "fail 4", "45s"} {
+	line := progressLine(plainStyler(), false, s, 100, 14, 312, 8, 45*time.Second)
+	for _, want := range []string{"importing", "36/100", "36%", "14/s", "↑8", "312 MB/s", "4 failed", "45s"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("line %q missing %q", line, want)
 		}
@@ -24,8 +30,8 @@ func TestProgressLineFormat(t *testing.T) {
 
 func TestProgressLineDryRunVerbAndCounts(t *testing.T) {
 	s := Summary{Total: 10, Valid: 7, Invalid: 3}
-	line := progressLine(true, s, 10, 0, 0, 0, time.Second)
-	for _, want := range []string{"validating", "10/10 (100%)", "ok 7", "invalid 3"} {
+	line := progressLine(plainStyler(), true, s, 10, 0, 0, 0, time.Second)
+	for _, want := range []string{"validating", "10/10", "100%", "valid 7", "invalid 3"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("dry-run line %q missing %q", line, want)
 		}
@@ -35,7 +41,7 @@ func TestProgressLineDryRunVerbAndCounts(t *testing.T) {
 func TestProgressLineUnknownTotal(t *testing.T) {
 	// total == 0 (count unknown): no percent, just a running count.
 	s := Summary{Total: 5}
-	line := progressLine(false, s, 0, 2, 0, 0, time.Second)
+	line := progressLine(plainStyler(), false, s, 0, 2, 0, 0, time.Second)
 	if strings.Contains(line, "%") {
 		t.Errorf("unknown-total line should omit percent: %q", line)
 	}
