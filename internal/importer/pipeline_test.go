@@ -33,7 +33,7 @@ func TestPipelineClampsDegenerateConcurrency(t *testing.T) {
 		stats: &liveStats{}, logger: quietLogger(),
 		uploadCap: 0, createConc: 0, // degenerate on purpose
 	}
-	recs := []workRecord{{line: 1, hash: "h", rec: Record{File: "a.jpg"}, size: 10}}
+	recs := []workRecord{{line: 1, hash: "h", file: "a.jpg", size: 10, raw: []byte(`{"file":"a.jpg"}`)}}
 	p.run(context.Background(), recs, nil)
 	close(results)
 	<-done

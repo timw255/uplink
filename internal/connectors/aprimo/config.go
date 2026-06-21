@@ -8,6 +8,10 @@ import (
 	"github.com/timw255/uplink/internal/connector"
 )
 
+// defaultRPS is Aprimo's standard sustained request allowance, used when a
+// connector doesn't set `rps`.
+const defaultRPS = 15
+
 // Config is the YAML schema for an aprimo connector instance.
 type Config struct {
 	// Environment is the Aprimo subdomain (the `<env>` in
@@ -76,11 +80,11 @@ type Config struct {
 	catalogUsage *catalogUsage
 
 	// RPS is the sustained per-second request budget the SDK paces
-	// itself against. Set to your tenant's licensed Aprimo RPS (the
-	// default Aprimo allowance is on the order of 15; higher values
-	// are licensable per environment). Burst capacity is fixed at
-	// 100 (Aprimo's documented burst buffer). 0 disables rate
-	// limiting — the SDK falls back to 429 retry.
+	// itself against. Defaults to 15, Aprimo's standard allowance; raise
+	// it to match a higher licensed rate on your environment. Burst
+	// capacity is fixed at 100 (Aprimo's documented burst buffer). Rate
+	// limiting can't be turned off — an explicit value of 0 or less is a
+	// config error.
 	//
 	// Match this knob to your environment's licensed RPS exactly:
 	// setting it lower wastes capacity, setting it higher trips
@@ -99,6 +103,7 @@ func loadConfig(name string, raw map[string]any) (*Config, error) {
 		RefreshInterval:         1 * time.Hour,
 		DirectUpload:            true,
 		DirectUploadConcurrency: defaultBlockCeiling,
+		RPS:                     defaultRPS,
 	}
 
 	if v, ok := raw["environment"].(string); ok {
@@ -148,10 +153,22 @@ func loadConfig(name string, raw map[string]any) (*Config, error) {
 	if v, ok := raw["max_concurrent"].(int); ok {
 		cfg.MaxConcurrent = v
 	}
-	if v, ok := raw["rps"].(int); ok {
-		cfg.RPS = float64(v)
-	} else if v, ok := raw["rps"].(float64); ok {
-		cfg.RPS = v
+	// rps is optional (defaults above); but if set it must be positive —
+	// rate limiting can't be disabled, and 0/negative would hammer the tenant.
+	if v, present := raw["rps"]; present {
+		var rps float64
+		switch n := v.(type) {
+		case int:
+			rps = float64(n)
+		case float64:
+			rps = n
+		default:
+			return nil, fmt.Errorf("aprimo[%s]: rps must be a number", name)
+		}
+		if rps <= 0 {
+			return nil, fmt.Errorf("aprimo[%s]: rps must be greater than 0 (rate limiting can't be disabled)", name)
+		}
+		cfg.RPS = rps
 	}
 
 	// Programmatic catalog-usage hint (import command only). Restricts which

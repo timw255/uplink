@@ -18,17 +18,35 @@ import (
 	"github.com/timw255/uplink/internal/connector"
 )
 
-// workRecord is a parsed manifest record carried through the pipeline,
-// annotated with the size we stat'd ourselves (scheduling input only).
+// workRecord carries one manifest line through the pipeline. It holds the raw
+// line bytes (re-parsed on demand for the full record) plus the routing fields
+// set during the pre-scan, rather than keeping every parsed record resident.
 type workRecord struct {
 	line int
 	hash string
-	rec  Record
-	size int64 // file size from the stat sweep; 0 for metadata-only
+	size int64  // stat'd file size; 0 for metadata-only
+	id   string // rec.ID, set during the pre-scan
+	file string // rec.File, set during the pre-scan
+	raw  []byte
 }
 
 func (w workRecord) result() Result {
-	return Result{Line: w.line, Hash: w.hash, File: w.rec.File}
+	return Result{Line: w.line, Hash: w.hash, File: w.file}
+}
+
+func (w workRecord) action() Action {
+	switch {
+	case w.id != "" && w.file != "":
+		return ActionUpdated
+	case w.id != "":
+		return ActionMetadata
+	default:
+		return ActionCreated
+	}
+}
+
+func (w workRecord) parse() (Record, error) {
+	return parseLine(w.raw)
 }
 
 // recoverPanic logs a recovered worker panic with its stack and returns
@@ -286,8 +304,8 @@ func (im *Importer) resolveMasterFiles(ctx context.Context, passed []workRecord)
 	}
 	var ids []string
 	for _, wr := range passed {
-		if wr.rec.action() == ActionUpdated { // id + file → needs the master file
-			ids = append(ids, wr.rec.ID)
+		if wr.action() == ActionUpdated { // id + file → needs the master file
+			ids = append(ids, wr.id)
 		}
 	}
 	if len(ids) == 0 {
@@ -434,9 +452,7 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 		}
 	}()
 
-	// Load + count the manifest. Parse failures and resume-skips are
-	// reported here; everything that parses goes into the work list.
-	recs, total, lerr := im.loadRecords(runCtx, done, results)
+	recs, total, lerr := im.scanManifest(runCtx, done, results)
 	if lerr != nil {
 		cancel()
 		close(results)
@@ -493,11 +509,10 @@ func (im *Importer) Run(ctx context.Context) (Summary, error) {
 	return summary, nil
 }
 
-// loadRecords reads the whole manifest into memory, parsing each line and
-// emitting skipped (resume) and parse-failure results as it goes. Returns
-// the records that parsed, the total non-blank line count (for progress),
-// and a setup error only when the manifest can't be opened/read.
-func (im *Importer) loadRecords(ctx context.Context, done map[string]bool, results chan<- Result) ([]workRecord, int, error) {
+// scanManifest reads the manifest once, holding each non-blank, not-already-
+// done line's raw bytes (parsing happens later, in the pre-scan). Resume-skips
+// are emitted here. Returns the index and the total non-blank line count.
+func (im *Importer) scanManifest(ctx context.Context, done map[string]bool, results chan<- Result) ([]workRecord, int, error) {
 	f, err := os.Open(im.opts.ManifestPath)
 	if err != nil {
 		return nil, 0, fmt.Errorf("open manifest: %w", err)
@@ -521,17 +536,8 @@ func (im *Importer) loadRecords(ctx context.Context, done map[string]bool, resul
 			emit(ctx, results, Result{Line: line, Hash: hash, Action: "skipped"})
 			continue
 		}
-		rec, perr := parseLine(raw)
-		if perr != nil {
-			res := Result{Line: line, Hash: hash}
-			if im.opts.DryRun {
-				emit(ctx, results, invalid(res, perr))
-			} else {
-				emit(ctx, results, fail(res, perr))
-			}
-			continue
-		}
-		recs = append(recs, workRecord{line: line, hash: hash, rec: rec})
+		// Copy: the scanner reuses its buffer on the next Scan.
+		recs = append(recs, workRecord{line: line, hash: hash, raw: append([]byte(nil), raw...)})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, total, fmt.Errorf("read manifest: %w", err)

@@ -120,7 +120,7 @@ On Windows PowerShell, use `$env:APRIMO_CLIENT_ID = "..."`.
 
 Connectors come in two roles: **sources** (where files come from — storage backends like local filesystems and cloud object stores) and **destinations** (where files land — DAMs). A channel binds one source to one destination plus a trigger, and runs one-way: source → destination. The individual connectors are documented below.
 
-Every connector follows the same credential pattern: any secret can be set **inline** in the YAML or via the matching `*_env` field, which resolves from an environment variable at startup. Env-var values win over inline when both are set. The pattern lets a tracked `configs/example.yaml` reference env vars while a gitignored `configs/local.yaml` carries actual secrets — or vice versa.
+Every connector follows the same credential pattern: any secret can be set **inline** in the YAML or via the matching `*_env` field, which resolves from an environment variable at startup. Env-var values win over inline when both are set.
 
 Duration fields like `poll_interval` and `http_timeout` are written as a sequence of decimal numbers each with a unit suffix, no whitespace. Valid units are `s`, `m`, `h` — seconds is the floor. Examples: `30s`, `2m`, `1h`, `2h30m`, `1.5h`. Sub-second values (`500ms`, `0.5s`) and larger units (`1d`, `1w`) are both rejected at config load.
 
@@ -214,18 +214,9 @@ Every source connector accepts an optional `watchers:` block that splits its tre
         poll_interval: "24h"
 ```
 
-How it partitions the tree:
+**Longest matching prefix wins** and coverage is disjoint — `incoming/hot/x.jpg` is owned by the 10s watcher alone, never scanned twice. Each watcher runs independently, so a slow archive scan can't hold up the hot loop. This is what makes "watch 1K hot files every 10s, scan 1M archived files once a day" performant.
 
-- **Longest matching prefix wins.** A file at `incoming/hot/x.jpg` is owned by the 10s watcher, NOT the root watcher. A file at `incoming/archive/2024/y.bin` is owned by the 24h watcher.
-- **Coverage is disjoint.** No file is ever scanned by two watchers. No double events.
-- **State is partitioned by watcher** (`fs-in` and `fs-in#hot/` are separate scope keys in the state table), so each loop runs independently — a stuck slow scan can't block the fast one.
-- **`sync_log` keys on the connector name, not the watcher.** A file moving from `hot/` to `archive/` shows up as an Update on the same Aprimo record — the watcher partition is an implementation detail, not a sync-log boundary.
-
-Identical prefixes within one connector are a config error. Omitting `watchers:` keeps the existing single-watcher behavior; this is fully backwards-compatible.
-
-Cost is bounded by `O(N_watcher × frequency)` summed across watchers, not `O(N_total × max_frequency)` — which is what makes "watch 1K hot files every 10s, watch 1M archived files once a day" actually performant.
-
-This works identically for s3 / azblob / b2 — same `watchers:` block, prefixes interpreted against the connector's configured prefix (e.g., S3 `prefix: media/` + watcher `prefix: hot/` watches `media/hot/`).
+Omitting `watchers:` keeps single-watcher behavior. Works identically for s3 / azblob / b2 — prefixes are interpreted against the connector's configured `prefix` (e.g. S3 `prefix: media/` + watcher `prefix: hot/` watches `media/hot/`).
 
 ### aprimo (destination)
 
@@ -252,12 +243,12 @@ The Aprimo DAM. Always the destination; never used as a source.
                                     # Default 1h. Set to 0s to disable; restart picks
                                     # up new fields when disabled. Companion scripts
                                     # reference these catalogs by display name.
-    rps: 15                         # sustained per-second request budget. Set this
-                                    # to your tenant's licensed Aprimo RPS (default
-                                    # allowance is on the order of 15; higher values
-                                    # are licensable per environment). 0 = disabled,
-                                    # SDK falls back to 429-retry only. See the
-                                    # "Rate limiting" subsection below.
+    rps: 15                         # optional; sustained per-second request budget.
+                                    # Defaults to 15 (Aprimo's standard allowance);
+                                    # raise it to match a higher licensed rate. Rate
+                                    # limiting can't be disabled — an explicit 0 or
+                                    # less is a config error. See the "Rate limiting"
+                                    # subsection below.
     max_concurrent: 32              # cap on in-flight Aprimo HTTP requests. Memory
                                     # + socket-pool safety net independent of `rps`.
                                     # 0 (default) = uncapped.
@@ -273,36 +264,19 @@ Authenticates via the `client_credentials` OAuth flow.
 
 #### Direct-to-blob uploads
 
-With `direct_upload: true` (the default), file bytes go **straight to Aprimo's backing blob storage** instead of through Aprimo's rate-limited upload API. So a large upload barely touches your `rps` budget — that budget goes to writing the record, not moving the bytes — and upload speed is bounded by your network, not Aprimo's API.
+With `direct_upload: true` (the default), file bytes go **straight to Aprimo's backing blob storage** instead of through Aprimo's rate-limited upload API — so a large upload barely touches your `rps` budget and is bounded by your network, not Aprimo's API. When the source is a cloud object store (**S3, Azure Blob, or B2**), Uplink goes further and has Azure pull the bytes directly from the source, so they never pass through the machine running Uplink — an Azure-to-Azure migration becomes an intra-cloud copy at line rate. (Azure Blob sources need shared-key or connection-string credentials for this.)
 
-When the source is a cloud object store with credentials — **S3, Azure Blob, or B2** — Uplink goes further and has Azure pull the bytes **directly from the source**, so they never pass through the machine running Uplink at all. An Azure-to-Azure migration becomes an intra-cloud copy at line rate. (Azure Blob sources need shared-key or connection-string credentials for this; otherwise the bytes stream through Uplink as usual.)
+If a **localfs** source lives on a spinning hard disk or NAS, set `sequential_reads: true` on that connector — parallel reads thrash the heads on spinning media. Leave it off for SSD/NVMe (the default).
 
-If a **localfs** source lives on a spinning hard disk or a NAS, set `sequential_reads: true` on that connector. Parallel reads thrash the heads and tank throughput on spinning media, so Uplink reads one file at a time instead. Leave it off for SSD/NVMe (the default).
-
-Upload concurrency tunes itself — ramping up to fill a fast pipe, easing off when idle. The one lever is `direct_upload_concurrency` on the Aprimo connector, which caps it; lower it only to limit memory on a tight machine (peak upload memory is roughly that number × 16 MB). `direct_upload: false` is the kill-switch — it routes uploads back through Aprimo's own upload service for tenants where the direct path misbehaves. Either way, an interrupted upload retries cleanly and the record is created exactly once.
-
-At startup (and again on every `refresh_interval` tick) the connector prefetches the tenant's field-definition, language, classification, option-item, user, and user-group catalogs so companion scripts can reference everything by display name without ever touching opaque GUIDs. New fields added in Aprimo become visible at the next refresh; renamed fields likewise. If `refresh_interval: 0s`, restart the daemon to pick up changes.
+Upload concurrency tunes itself. `direct_upload_concurrency` caps it; lower it only to limit memory on a tight machine (roughly that number × 16 MB at peak). `direct_upload: false` is the kill-switch — it routes uploads back through Aprimo's upload service for tenants where the direct path misbehaves. Either way, an interrupted upload retries cleanly and the record is created exactly once.
 
 #### Rate limiting
 
-Aprimo enforces a per-tenant **token bucket** on its REST API:
+Aprimo enforces a per-tenant token bucket: a sustained **rps** (the standard allowance is 15; higher is licensable) plus a 100-request burst buffer. Requests over the limit get **HTTP 429**. The `rps` knob paces Uplink to match, so the daemon never overdrives the API and you don't see 429s under normal load.
 
-- A **sustained rate** measured in requests per second (RPS). The default Aprimo allowance is on the order of 15 RPS per environment; higher values are licensable.
-- A **burst buffer** of up to 100 requests. When the bucket is full (e.g., after a quiet period), the next 100 requests fire instantly. After that, requests pace at the sustained RPS until the bucket refills.
-- Requests over both limits return **HTTP 429 Too Many Requests**.
+Set `rps` to your tenant's licensed value: too low under-utilizes your license; too high trips 429s (the SDK retries with backoff, just less gracefully). `rps` defaults to **15** when unset, and rate limiting can't be turned off — an explicit `0` or negative value is a config error.
 
-The `rps` knob on the Aprimo connector mirrors this model client-side: Uplink installs a local token bucket with your configured RPS and the same 100-token burst. Every outbound API call (uploads, record creates, catalog fetches) acquires one token before firing, so the daemon never tries to drive Aprimo faster than the server is willing to accept. Result: **no 429s under normal load** — the retry path is reserved for genuinely unexpected throttling (other clients of the same tenant, maintenance windows, etc.).
-
-Tune `rps` to match your tenant's licensed value exactly:
-
-| `rps` setting | Effect |
-|---|---|
-| Equal to licensed RPS | Optimal — daemon paces itself perfectly, zero 429s. |
-| Lower than licensed | Daemon under-utilizes; throughput capped below what your license allows. |
-| Higher than licensed | Daemon overshoots; Aprimo returns 429s; SDK retries with backoff. Throughput throttled by server, just less gracefully. |
-| `0` (default) | No client-side pacing. SDK relies on 429-retry alone — fine for low workloads, painful at scale. |
-
-The `max_concurrent` knob is a separate concern: it caps how many HTTP requests are *in flight at once* (independent of their rate). Useful as a memory + socket-pool safety net when you have many workers × parallel segments. Setting `max_concurrent: 32` is reasonable for production; the rate limiter does most of the heavy lifting and `max_concurrent` keeps the in-flight set bounded.
+`max_concurrent` is separate: it caps how many requests are *in flight at once* (not their rate) — a memory/socket safety net. `max_concurrent: 32` is reasonable for production; `0` (default) is uncapped.
 
 ### Channels
 
@@ -319,9 +293,9 @@ channels:
       # filter: 'size > 0'            # optional filter expression
 ```
 
-Use `event` for a single kind or `events` for a list — exactly one of the two must be set. A multi-event channel keeps a single sync_log stream per source path, so a file's Update lands as a new version on the same Aprimo record as its Create. Splitting Create and Update across separate channels gives each its own history and produces duplicate records on Update, which is rarely what you want.
+Use `event` for a single kind or `events` for a list — exactly one of the two must be set. Keep Create and Update on the **same** channel so a file's Update lands as a new version on the same record; splitting them across channels produces duplicate records on Update.
 
-Available kinds: `OnCreate`, `OnUpdate`, `OnDelete`. Source-side deletes are not propagated to Aprimo by design — an Aprimo record outliving its source file is the intended behavior. (There is intentionally no "move" kind: the supported backends have no rename primitive and no durable object id, so a relocation is a delete of the old path plus a create of the new one — see the note under [Enrich scripts](#enrich-scripts-metadata-from-the-asset-itself).)
+Available kinds: `OnCreate`, `OnUpdate`, `OnDelete`. Source-side deletes are **not** propagated to Aprimo by design — a record outlives its source file. (There's no "move" kind; see the note under [Enrich scripts](#enrich-scripts-metadata-from-the-asset-itself).)
 
 Filter expressions use Google's [Common Expression Language](https://github.com/google/cel-spec) — the operators you'd expect are available: `==`, `!=`, `<`, `>`, `&&`, `||`, plus string helpers like `startsWith`, `endsWith`, `contains`, and the `in` membership test.
 
@@ -365,15 +339,14 @@ A pattern is matched only on filenames within the asset's directory; it cannot c
 
 A companion file never becomes its own Aprimo record. What happens depends on whether the parent asset exists yet:
 
-- **Companion arrives before the asset.** The companion's own source event is dropped at dispatch (no parent row in `sync_log` to PATCH). When the asset arrives, the Create job runs a **presync** sweep: it lists the asset's directory, finds every file matching one of the channel's companion patterns, runs each script, and folds the returned fields into the Aprimo `Create` call. One API call instead of one Create + N PATCHes.
-- **Companion arrives after the asset.** The dispatcher locates the parent's `sync_log` row, enqueues a companion job. The worker reads the companion's bytes, runs the script, and PATCHes the returned fields onto the existing record.
-- **Companion modified.** Same path as "after." Each change PATCHes the latest field values onto the parent's record.
-- **Companion deleted.** The script is invoked with `uplink.file.deleted = true` and `uplink.file.content = nil`. The script decides whether to PATCH (e.g., emit an empty value to clear a locale) or return `{}` (no-op). **The Aprimo record itself is never deleted by a companion event** — that's by design, same as source-side deletes of assets.
-- **Asset content updated.** No companion presync re-runs. The existing record's metadata is left alone; companions PATCH separately when they themselves change. If you want a new content version on the same record without re-deriving metadata, change the asset; if you want updated metadata, touch the companion.
+- **Companion before the asset.** When the asset arrives, its Create runs a **presync** sweep — every matching companion in the directory runs and its fields fold into the single `Create` call (no extra PATCHes).
+- **Companion after the asset** (or modified). The script runs and PATCHes the returned fields onto the existing record.
+- **Companion deleted.** The script runs with `uplink.file.deleted = true` and decides whether to PATCH (e.g. clear a locale) or return `{}`. **The record is never deleted by a companion event.**
+- **Asset content updated.** Companions don't re-run; their metadata is left alone. Touch the companion if you want its fields re-derived.
 
 #### The contract a script honors
 
-**Return a list of `{ name = "...", value = ... }` entries** (optionally with `language = "<culture>"`). `name` matches the field's display name in Aprimo's admin UI; case + surrounding whitespace are normalized. `language` is an IETF culture tag like `"en-US"` / `"fr-FR"`; when omitted, the value goes to the connector's `default_language`. Return `{}` to contribute nothing. The Aprimo connector looks at each field's data type, resolves names (classifications, option items, users, user groups, languages) to their internal IDs, formats the value to whatever wire shape Aprimo requires for that type, and consolidates same-field-different-language entries into one localized write. You never write `fieldId`, `languageId`, `addOrUpdate`, or `localizedValues` in the script.
+**Return a list of `{ name = "...", value = ... }` entries** (optionally with `language = "<culture>"`). `name` matches the field's display name in Aprimo (case + surrounding whitespace normalized); `language` is an IETF culture tag like `"en-US"`, defaulting to the connector's `default_language` when omitted. Return `{}` to contribute nothing. The connector resolves names (classifications, users, option items, …) to IDs and formats values per the field's type — you never write `fieldId`, `languageId`, or `localizedValues` yourself.
 
 #### Supported field types
 
@@ -398,13 +371,11 @@ Every Aprimo field type works — the resolver coerces the script's `value` into
 
 Single-value list types accept either a scalar (one entry) or a list (multiple) — `value = "Marketing"` and `value = {"Marketing"}` are equivalent for an OptionList. Same-field-different-language entries collapse into one Aprimo write carrying multiple localized values.
 
-> **The catalogs refresh in the background.** By default the Aprimo connector reloads field definitions, languages, classifications, option items, users, and user groups every hour (`refresh_interval`). New fields appear without a daemon restart. Set `refresh_interval: 0` to disable.
-
 #### The sandbox
 
-Scripts run in a `gopher-lua` interpreter with a curated `uplink.*` global table. The dangerous stdlib (`os`, `io`, `debug`, `package`, `require`, `loadfile`, `dofile`, `load`, `loadstring`, `print`) is structurally absent — there's no filesystem access, no network, no process execution outside what `uplink.*` exposes. Each execution runs in a fresh Lua state with a 5-second wall-clock timeout and a 64 MiB memory ceiling.
+Scripts run in a sandboxed `gopher-lua` interpreter: no filesystem, no network, no process access — the dangerous stdlib (`os`, `io`, `debug`, `require`, `load`, …) is absent. Each runs in a fresh state with a 5-second wall-clock timeout.
 
-The script sees exactly the file the engine triggered it on — there is **no** `read_file` or `list_files`. A script that needs to consult another file is signalling that the declaration model is wrong: add a second companion entry with its own pattern and script.
+A script sees only the file it was triggered on — there is **no** `read_file` or `list_files`. Need another file? Add a second companion entry with its own pattern.
 
 | Name | Shape |
 |---|---|
@@ -536,7 +507,7 @@ return out
 
 Same `name` × different `language` entries consolidate into one Aprimo write carrying all the locales — no need to repeat the field name across multiple records.
 
-The contrast with the previous example: per-language files give you one-write-per-locale (each file PATCHes independently when it changes); a JSON bundle gives you one-write-per-edit (a single change rewrites every locale). Pick the shape that matches how the upstream tool emits the data.
+Per-language files give one write per locale (each PATCHes independently); a JSON bundle gives one write per edit (a change rewrites every locale). Pick what matches how the upstream tool emits the data.
 
 Scripts are compiled at daemon startup; a syntactically broken script fails the daemon's startup so a bad change never silently corrupts metadata. Edits require a daemon restart.
 
@@ -567,7 +538,7 @@ Enrich scripts run on the asset's own events, **honoring the channel's `trigger`
 | **OnUpdate** | Content changed; script re-runs and fields fold into the same Update write. Path-derived tags stay correct. | folded into Update (no extra call) |
 | **OnDelete** | Script runs with `uplink.event.deleted = true`; returned fields are **PATCHed** onto the existing record. The Aprimo record is **never deleted** — this is for flipping a field like `Lifecycle Status = "Retired"`. Dropped silently if the asset was never synced. | one PATCH |
 
-A note on **moves / renames**: there is no `OnMove` trigger, by design. Uplink's scanners detect changes by diffing the backend listing *by path*, and the supported object stores (S3, Azure Blob, B2) have no rename primitive and expose no durable object id that survives a copy — so a relocation is genuinely indistinguishable from a **delete of the old path plus a create of the new path**, and that is exactly how it's reported. The practical consequence: moving a file does **not** re-file its existing record. The new path mints a fresh record (with new-path-derived fields via OnCreate) while OnDelete fires against the record at the old path. If your intent was to re-classify or re-collection an existing asset, **don't do it by moving files** — the identity isn't carried across. Treat the source tree's layout as fixed once an asset is synced, and drive re-classification from a companion or enrich *field* instead.
+**Moves / renames:** there's no `OnMove` trigger — the backends expose no durable object id that survives a copy, so a relocation is reported as a delete of the old path plus a create of the new one. Moving a file mints a fresh record (new-path fields via OnCreate) and fires OnDelete against the old one; it does **not** re-file the existing record. Don't re-classify by moving files — drive it from a companion or enrich *field* instead.
 
 #### The script contract
 
@@ -669,21 +640,14 @@ engine:
 
 ### Worker concurrency is automatic
 
-You don't set a worker count for throughput. As long as a destination has `rps` configured (the normal case), the engine **auto-scales the number of concurrent jobs** to keep the Aprimo rate limiter saturated — the same adaptive pool the [bulk importer](#speed) uses. It watches how hard the limiter is actually being driven and grows the pool under a backlog, holds once it's running at the licensed `rps`, and shrinks back when the queue goes idle. A burst of big files ramps up to many concurrent uploads; a trickle of small ones settles low. The `rps` token bucket is a hard ceiling, so more workers can never exceed your tenant's rate — they only stop you from *under*-driving it.
+You don't set a worker count for throughput. With `rps` configured (always, by default), the engine **auto-scales** concurrent jobs to keep the rate limiter saturated — ramping up under a backlog, settling low when idle. The `rps` bucket is a hard ceiling, so more workers can never exceed your tenant's rate; they only keep you from under-driving it. Raise the destination's `max_concurrent` to let it run wider.
 
-Because the work is network I/O end to end (Stat + read + segmented upload + record write — almost no CPU), the pool is **not** bounded by core count. Its ceiling is a memory/socket safety bound, taken from the destination's `max_concurrent` (or 64 when that's uncapped). That's the number to raise if you want to let it run wider.
+The knobs (all optional):
 
-When to set each knob:
-
-- **`workers`** (optional): set it to **pin a fixed pool** of exactly this many concurrent jobs and turn auto-scaling **off** — useful when you want deterministic, predictable concurrency instead of letting the engine size itself. Leave it unset for the auto-scaling default. (If **no** destination has `rps` configured there's no rate signal to scale against, so the engine runs a fixed pool of `workers` jobs, default 4, either way.)
-
-- **`poll_idle`** (default 500ms): how long a worker waits between `ClaimNextJob` attempts when nothing's ready. Lower = more responsive on the first event after an idle period, higher = less SQLite traffic. 500ms is fine for almost everything. Drop to 100ms only if you measurably need faster pickup.
-
-- **`max_attempts`** (default 5): how many times the engine retries a failing job before it lands in the `failed` queue (where it sits until an operator runs `uplink retry`). Permanent failures (e.g., a 403 from Aprimo) will burn through all five quickly anyway thanks to the exponential backoff. Bumping this rarely helps; it just delays the operator-visible failure.
-
-- **`base_backoff`** (default 2s): the first retry delay. The engine doubles it each attempt, capped at 5 minutes. With defaults: 2s, 4s, 8s, 16s, 32s, then capped. Increase for backends with slow recovery from transient errors; rarely needed.
-
-The engine block is optional — omit it and you get the defaults above.
+- **`workers`** — pin a fixed pool of this many jobs, turning auto-scaling **off**. Leave unset for the auto-scaling default.
+- **`poll_idle`** (default 500ms) — how long a worker waits when no job is ready. Drop to 100ms only if you need faster pickup after idle.
+- **`max_attempts`** (default 5) — retries before a job lands in `failed` (run `uplink retry` to re-enqueue). Bumping it rarely helps.
+- **`base_backoff`** (default 2s) — first retry delay; doubles each attempt, capped at 5m.
 
 ## Subcommands
 
@@ -695,7 +659,7 @@ uplink run
 
 With no `--config`, the daemon loads `uplink.yaml` from the binary's directory.
 
-The other subcommands operate on the same data directory the daemon uses. SQLite WAL mode means they're safe to run while the daemon is up.
+The other subcommands operate on the same data directory and are safe to run while the daemon is up.
 
 ```sh
 uplink status   --data-dir=./data                          # job + sync_log summary
@@ -710,16 +674,9 @@ uplink version
 
 `uplink help` prints the same list at the CLI.
 
-## If the daemon crashes mid-sync
-
-Restart it. Each in-flight upload has a marker file in `data/uploads/`; the next claim picks up from where it left off — committed segments are not re-sent and records are not duplicated. `uplink inspect upload --job=<id>` prints any marker that's still in flight.
-
-
 ## Bulk import
 
-The daemon is built for the steady state — files landing in a watched backend, one at a time, forever. A bulk import is the opposite shape: a one-shot batch you want in Aprimo now. Maybe you're migrating a pile of assets with an export of their metadata; maybe you're uploading 200k new files in one go, or stamping metadata across thousands of records that already exist. Same path either way. `uplink import` reads a JSONL manifest (one record per line) and, for each line, either creates a new record from an uploaded file, attaches a new file version to an existing record, or patches metadata onto an existing record — your choice, per line.
-
-The import command stores state in a per-manifest ledger under the data dir recording which records are already done, so a re-run never uploads the same file twice. See [The ledger](#the-ledger-resume-and-dedup) below.
+The daemon handles the steady state; `uplink import` handles a one-shot batch — migrating a pile of assets with their metadata, uploading 200k new files at once, or stamping metadata across records that already exist. It reads a JSONL manifest (one record per line) and per line either creates a record from an uploaded file, attaches a new version to an existing record, or patches metadata onto one. A per-manifest ledger means a re-run never uploads the same file twice (see [The ledger](#the-ledger-resume-and-dedup)).
 
 ### The manifest
 
@@ -757,7 +714,7 @@ uplink import --file=records.jsonl --source=fs-in --dry-run
 
 A dry run validates every line without writing anything: it confirms each line has an `id` or a `file`, that any `file` actually exists at its path under `--source`, and that every field resolves against the live Aprimo catalog (field names exist, classifications/option-items/users/languages resolve, values coerce). It still authenticates and prefetches the catalog — it just makes no changes. The command exits non-zero if any line fails validation, so it drops straight into an import script or CI gate. Fix the manifest, re-run until clean, then drop `--dry-run`.
 
-Aprimo forbids `< > : " / \ | ? *` (and control characters) in a filename, so on upload Uplink replaces any of them with `_`. The dry run **flags every name it will rewrite** — logged as a warning (`old -> new`) and tallied in the summary as `filenames to be rewritten: N`. The line is still valid; this is just a heads-up so you can spot surprises — `a:b.jpg` and `a/b.jpg` both become `a_b.jpg` — before committing to a large import.
+Aprimo forbids `< > : " / \ | ? *` and control characters in filenames, so Uplink replaces any with `_` on upload. The dry run **flags every name it will rewrite** so there are no surprises (`a:b.jpg` and `a/b.jpg` both become `a_b.jpg`).
 
 ### Running it
 
@@ -782,23 +739,17 @@ The connector config (`rps`, `direct_upload`, `direct_upload_concurrency`, `sequ
 
 ### The ledger (resume and dedup)
 
-Every import keeps a ledger under the data dir, keyed to the (manifest, destination) pair:
+Every import keeps a ledger under the data dir, keyed to the (manifest, destination) pair. It tracks what's finished, so **re-running resumes where it left off**: records already created/updated/stamped are skipped, and a file that finished uploading won't upload again. You never redo the slow part, and the same file is never uploaded twice.
 
-```
-<data_dir>/imports/<manifest>-<hash>.jsonl
-```
-
-It tracks what's finished, so **re-running resumes where it left off**: records already created, updated, or stamped are skipped, and a file that finished uploading won't upload again — even if the run was killed before that record was written. You never redo the slow part, and the same file is never uploaded twice. (If an upload sat half-finished long enough for Aprimo to clean it up, that one file simply re-uploads.)
-
-Failed and invalid lines aren't marked done, so they retry on the next run. You normally don't touch any of this — just re-run the command and it picks up where it left off. `--restart` is the one knob: it ignores all prior progress and re-processes every line from scratch. A dry run keeps no ledger.
+Failed and invalid lines aren't marked done, so they retry next run. You normally don't touch any of this — just re-run. `--restart` ignores all prior progress and re-processes every line. A dry run keeps no ledger.
 
 ### Speed
 
-A bulk import is held back by two limits at once: Aprimo's API rate (your licensed `rps`) and your network bandwidth (moving the file bytes). Uplink works **both at the same time** — bytes upload straight to storage [off the rate limiter](#direct-to-blob-uploads) while records write at full `rps` — so a slow multi-gigabyte upload never stalls record creation. You don't set any of this; it scales itself to your machine and your pipe.
+A bulk import is bounded by two limits at once — Aprimo's API rate (`rps`) and your network bandwidth. Uplink works **both at the same time**: bytes upload straight to storage [off the rate limiter](#direct-to-blob-uploads) while records write at full `rps`, so a slow multi-gigabyte upload never stalls record creation. It scales itself; you don't set any of it.
 
-To rein it in on a constrained machine, the levers are:
+To rein it in on a constrained machine:
 
-- `direct_upload_concurrency` (on the Aprimo connector) — the memory cap on the upload side; see [direct-to-blob](#direct-to-blob-uploads).
-- `--create-concurrency=N` (default 16) — concurrent record writes. The `rps` limiter already paces these, so lower it only to hold writes below your licensed rate.
-- `--upload-concurrency=N` — how many files are in flight at once (`--max-workers` is an alias).
+- `direct_upload_concurrency` (Aprimo connector) — caps upload-side memory; see [direct-to-blob](#direct-to-blob-uploads).
+- `--create-concurrency=N` (default 16) — concurrent record writes (already paced by `rps`).
+- `--upload-concurrency=N` — files in flight at once (`--max-workers` is an alias).
 

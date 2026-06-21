@@ -77,10 +77,16 @@ func (v *validator) prescan(ctx context.Context, recs []workRecord, results chan
 		passed = make([]workRecord, 0, len(recs))
 	)
 	parallelScan(ctx, recs, concurrency, func(wr workRecord) {
+		rec, perr := wr.parse()
+		if perr != nil {
+			emit(ctx, results, fail(wr.result(), perr))
+			return
+		}
+		wr.id, wr.file = rec.ID, rec.File
 		// A record with a saved token can be created without its source
 		// file, so a since-deleted file must not fail it.
 		_, preUploaded := uploaded[wr.hash]
-		size, err := v.safe(ctx, wr.rec, wr.line, !preUploaded)
+		size, err := v.safe(ctx, rec, wr.line, !preUploaded)
 		if err != nil {
 			emit(ctx, results, fail(wr.result(), err))
 			return
@@ -97,21 +103,27 @@ func (v *validator) prescan(ctx context.Context, recs []workRecord, results chan
 // the whole job of a dry run. It writes nothing.
 func (v *validator) dryRun(ctx context.Context, recs []workRecord, results chan<- Result, concurrency int) {
 	parallelScan(ctx, recs, concurrency, func(wr workRecord) {
+		rec, perr := wr.parse()
+		if perr != nil {
+			emit(ctx, results, invalid(wr.result(), perr))
+			return
+		}
+		wr.id, wr.file = rec.ID, rec.File
 		res := wr.result()
-		if _, err := v.safe(ctx, wr.rec, wr.line, true); err != nil {
+		if _, err := v.safe(ctx, rec, wr.line, true); err != nil {
 			emit(ctx, results, invalid(res, err))
 			return
 		}
 		// Valid — but flag a filename Aprimo will rewrite so collisions are
 		// visible before the real run.
-		if wr.rec.File != "" {
-			if base := path.Base(wr.rec.File); base != "" {
+		if rec.File != "" {
+			if base := path.Base(rec.File); base != "" {
 				if clean := aprimo.SanitizeFilename(base); clean != base {
 					res.Warn = fmt.Sprintf("filename rewritten for Aprimo: %q -> %q", base, clean)
 				}
 			}
 		}
-		res.Action, res.DestID = "valid", wr.rec.ID
+		res.Action, res.DestID = "valid", rec.ID
 		emit(ctx, results, res)
 	})
 }

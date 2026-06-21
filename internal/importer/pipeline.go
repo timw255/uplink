@@ -100,7 +100,7 @@ func (p *pipeline) run(ctx context.Context, passed []workRecord, uploaded map[st
 // create queue. File records are sorted ascending by size for the blend.
 func (p *pipeline) partition(passed []workRecord, uploaded map[string]string) (fileRecs []workRecord, direct []createJob) {
 	for _, wr := range passed {
-		if wr.rec.File == "" {
+		if wr.file == "" {
 			direct = append(direct, createJob{wr: wr})
 			continue
 		}
@@ -184,17 +184,30 @@ func (p *pipeline) startDirectFeed(ctx context.Context, createWork chan<- create
 	return done
 }
 
+// meta parses the record's held line and builds the connector meta map.
+func (p *pipeline) meta(wr workRecord) (map[string]any, error) {
+	rec, err := wr.parse()
+	if err != nil {
+		return nil, err
+	}
+	return rec.meta(), nil
+}
+
 // upload streams one file's bytes to blob storage and returns the create
 // job carrying its token. The size came from the pre-scan, so no re-stat.
 func (p *pipeline) upload(ctx context.Context, wr workRecord) (createJob, error) {
-	seg := connector.SegmentSourceFor(p.source, connector.Entry{Path: wr.rec.File, Size: wr.size})
+	meta, err := p.meta(wr)
+	if err != nil {
+		return createJob{}, err
+	}
+	seg := connector.SegmentSourceFor(p.source, connector.Entry{Path: wr.file, Size: wr.size})
 	if p.stats != nil {
 		p.stats.uploadsInFlight.Add(1)
 		// Deferred so a panic in UploadOnly (recovered upstream) can't leak
 		// the in-flight count.
 		defer p.stats.uploadsInFlight.Add(-1)
 	}
-	token, err := p.dest.UploadOnly(ctx, wr.rec.File, seg, wr.rec.meta())
+	token, err := p.dest.UploadOnly(ctx, wr.file, seg, meta)
 	if err != nil {
 		return createJob{}, err
 	}
@@ -211,41 +224,44 @@ func (p *pipeline) upload(ctx context.Context, wr workRecord) (createJob, error)
 // retry — no timestamp guard, just handle the failure.
 func (p *pipeline) create(ctx context.Context, cj createJob) Result {
 	res := cj.wr.result()
-	meta := cj.wr.rec.meta()
-	if mf := p.masterFiles[cj.wr.rec.ID]; mf != "" {
+	meta, err := p.meta(cj.wr)
+	if err != nil {
+		return fail(res, err)
+	}
+	if mf := p.masterFiles[cj.wr.id]; mf != "" {
 		meta["dest_master_file_id"] = mf // skip the per-record MasterFile GET
 	}
 	if p.deferCollection {
 		meta["defer_collection_add"] = true // importer batch-files after the run
 	}
-	if cj.wr.rec.File == "" {
-		if err := p.dest.WriteMetadata(ctx, cj.wr.rec.ID, meta); err != nil {
+	if cj.wr.file == "" {
+		if err := p.dest.WriteMetadata(ctx, cj.wr.id, meta); err != nil {
 			return fail(res, err)
 		}
-		res.Action, res.DestID = string(ActionMetadata), cj.wr.rec.ID
+		res.Action, res.DestID = string(ActionMetadata), cj.wr.id
 		return res
 	}
-	entry, err := p.dest.CreateFromToken(ctx, cj.wr.rec.File, cj.token, meta)
+	entry, err := p.dest.CreateFromToken(ctx, cj.wr.file, cj.token, meta)
 	if err != nil && errors.Is(err, aprimo.ErrUploadTokenMissing) && p.source != nil {
 		// The saved token's blob was swept. Re-stat first (the pre-scan may
 		// have skipped or zeroed the size for a pre-uploaded record) so a
 		// since-deleted source fails cleanly instead of uploading an empty
 		// blob, and the re-upload streams the real bytes.
-		statEntry, serr := p.source.Stat(ctx, cj.wr.rec.File)
+		statEntry, serr := p.source.Stat(ctx, cj.wr.file)
 		if serr != nil {
-			return fail(res, fmt.Errorf("re-upload stat %q: %w", cj.wr.rec.File, serr))
+			return fail(res, fmt.Errorf("re-upload stat %q: %w", cj.wr.file, serr))
 		}
 		cj.wr.size = statEntry.Size
 		job, uerr := p.upload(ctx, cj.wr)
 		if uerr != nil {
 			return fail(res, uerr)
 		}
-		entry, err = p.dest.CreateFromToken(ctx, cj.wr.rec.File, job.token, meta)
+		entry, err = p.dest.CreateFromToken(ctx, cj.wr.file, job.token, meta)
 	}
 	if err != nil {
 		return fail(res, err)
 	}
-	res.Action, res.DestID = string(cj.wr.rec.action()), entry.Path
+	res.Action, res.DestID = string(cj.wr.action()), entry.Path
 	return res
 }
 
